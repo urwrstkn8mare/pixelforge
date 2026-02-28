@@ -19,8 +19,8 @@ use crate::vulkan::VideoContext;
 /// Minimum bitstream buffer size.
 const MIN_BITSTREAM_BUFFER_SIZE: usize = 2 * 1024 * 1024;
 
-/// AV1 superblock size in pixels (128x128 for most cases).
-pub const SUPERBLOCK_SIZE: u32 = 128;
+/// AV1 superblock size in pixels (64x64, matching use_128x128_superblock=0 in the sequence header).
+pub const SUPERBLOCK_SIZE: u32 = 64;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReferenceInfo {
@@ -64,6 +64,8 @@ pub struct AV1Encoder {
     dpb_slot_active: Vec<bool>,
     bitstream_buffer: vk::Buffer,
     bitstream_buffer_memory: vk::DeviceMemory,
+    /// Size of the allocated bitstream buffer in bytes.
+    bitstream_buffer_size: usize,
     /// Persistently mapped pointer to the bitstream buffer (avoids per-frame map/unmap).
     bitstream_buffer_ptr: *mut u8,
 
@@ -130,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_superblock_size() {
-        assert_eq!(SUPERBLOCK_SIZE, 128);
+        assert_eq!(SUPERBLOCK_SIZE, 64);
     }
 
     #[test]
@@ -139,10 +141,10 @@ mod tests {
         let align = |v: u32| (v + SUPERBLOCK_SIZE - 1) & !(SUPERBLOCK_SIZE - 1);
 
         assert_eq!(align(1920), 1920); // Already aligned
-        assert_eq!(align(1080), 1152); // 1080 rounds up to 1152
+        assert_eq!(align(1080), 1088); // 1080 rounds up to 1088
         assert_eq!(align(2560), 2560); // Already aligned
-        assert_eq!(align(1440), 1536); // 1440 rounds up to 1536
-        assert_eq!(align(1), 128); // Minimum is one superblock
+        assert_eq!(align(1440), 1472); // 1440 rounds up to 1472
+        assert_eq!(align(1), 64); // Minimum is one superblock
     }
 
     #[test]

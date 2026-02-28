@@ -1,21 +1,38 @@
 //! Image utilities for creating and uploading video frames.
 //!
-//! This module provides utilities for creating Vulkan images suitable for video encoding.
-//! and uploading YUV data to them.
+//! This module provides [`InputImage`], a helper for uploading YUV data from the CPU
+//! to the GPU. The image it creates is a transfer-only staging image (not a Vulkan Video
+//! image) and must be copied into an encoder's input image before encoding.
+//! Use [`InputImage::upload_yuv420`] to upload to the internal image, then pass
+//! `input_image.image()` to [`Encoder::encode`](crate::encoder::Encoder::encode).
+//! Alternatively, use [`InputImage::upload_yuv420_to`] / [`InputImage::upload_yuv444_to`]
+//! to upload directly into the encoder's input image (obtained via
+//! [`Encoder::input_image`](crate::encoder::Encoder::input_image)).
 
 use crate::encoder::{BitDepth, Codec, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
 
-/// An image on the GPU ready for video encoding.
+/// A GPU image for staging YUV frame data before encoding.
 ///
-/// This struct owns a Vulkan image with NV12/P010 format (YUV420) or
-/// 2-plane semi-planar YUV444 format and provides methods to upload YUV data to it.
-/// The image can be passed directly to the encoder.
+/// This struct owns a transfer-only Vulkan image (no video profile, no
+/// `VIDEO_ENCODE_SRC_KHR` usage) with NV12/P010 format (YUV420) or 2-plane
+/// semi-planar YUV444 format. It provides methods to upload YUV data from the
+/// CPU, which can then be copied into an encoder's input image for encoding.
+///
+/// The image is **not** directly usable as a Vulkan Video encode source. To
+/// encode, either:
+/// - Upload to this image and pass `self.image()` to [`Encoder::encode`](crate::encoder::Encoder::encode), which
+///   will copy it into the encoder's internal input image, or
+/// - Use [`upload_yuv420_to`](Self::upload_yuv420_to) /
+///   [`upload_yuv444_to`](Self::upload_yuv444_to) to upload directly into the
+///   encoder's input image.
 pub struct InputImage {
     context: VideoContext,
     image: vk::Image,
+    /// Current layout of `self.image`.
+    image_layout: vk::ImageLayout,
     memory: vk::DeviceMemory,
     staging_buffer: vk::Buffer,
     staging_memory: vk::DeviceMemory,
@@ -32,16 +49,15 @@ pub struct InputImage {
 }
 
 impl InputImage {
-    /// Create a new input image for video encoding.
+    /// Create a new staging image for uploading YUV frame data.
     ///
-    /// Creates an image suitable for use as input to the video encoder.
-    /// For YUV420: NV12 (8-bit) or P010 (10-bit) format.
-    /// For YUV444: 2-plane semi-planar format (8-bit or 10-bit).
-    /// The image is allocated in device-local memory for optimal performance.
+    /// Creates a transfer-only image suitable for staging YUV data before
+    /// copying it into an encoder's input image. The image has no video
+    /// profile and uses `TRANSFER_DST | TRANSFER_SRC` usage flags.
     ///
     /// # Arguments
     /// * `context` - The Vulkan video context
-    /// * `codec` - The video codec (H.264/H.265)
+    /// * `codec` - Unused. Kept for API compatibility.
     /// * `width` - Image width in pixels
     /// * `height` - Image height in pixels
     /// * `bit_depth` - Bit depth for the image (8-bit or 10-bit)
@@ -183,6 +199,7 @@ impl InputImage {
         Ok(Self {
             context,
             image,
+            image_layout: vk::ImageLayout::UNDEFINED,
             memory,
             staging_buffer,
             staging_memory,
@@ -480,7 +497,11 @@ impl InputImage {
         }
 
         // Record and submit copy commands to the target image.
-        self.copy_staging_to_image_internal(target_image)?;
+        self.copy_staging_to_image_internal(
+            target_image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
+        )?;
 
         Ok(())
     }
@@ -557,16 +578,28 @@ impl InputImage {
         }
 
         // Record and submit copy commands.
-        self.copy_staging_to_image_internal(target_image)?;
+        self.copy_staging_to_image_internal(
+            target_image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
+        )?;
 
         Ok(())
     }
 
     fn copy_staging_to_image(&mut self) -> Result<()> {
-        self.copy_staging_to_image_internal(self.image)
+        let old_layout = self.image_layout;
+        self.copy_staging_to_image_internal(self.image, old_layout, vk::ImageLayout::GENERAL)?;
+        self.image_layout = vk::ImageLayout::GENERAL;
+        Ok(())
     }
 
-    fn copy_staging_to_image_internal(&mut self, target_image: vk::Image) -> Result<()> {
+    fn copy_staging_to_image_internal(
+        &mut self,
+        target_image: vk::Image,
+        old_layout: vk::ImageLayout,
+        final_layout: vk::ImageLayout,
+    ) -> Result<()> {
         let device = self.context.device();
         let width = self.width;
         let height = self.height;
@@ -592,7 +625,7 @@ impl InputImage {
 
         // Transition image to transfer destination.
         let barrier = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::UNDEFINED)
+            .old_layout(old_layout)
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -717,10 +750,10 @@ impl InputImage {
             );
         }
 
-        // Transition image to GENERAL (ready for encoding)
+        // Transition image to final layout (ready for its intended use)
         let barrier = vk::ImageMemoryBarrier::default()
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
+            .new_layout(final_layout)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(target_image)

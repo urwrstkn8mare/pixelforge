@@ -1,4 +1,4 @@
-use super::{AV1Encoder, MIN_BITSTREAM_BUFFER_SIZE};
+use super::AV1Encoder;
 
 use crate::encoder::gop::GopPosition;
 use crate::encoder::resources::{
@@ -456,7 +456,7 @@ impl AV1Encoder {
             .src_picture_resource(src_picture_resource)
             .dst_buffer(self.bitstream_buffer)
             .dst_buffer_offset(0)
-            .dst_buffer_range(MIN_BITSTREAM_BUFFER_SIZE as u64);
+            .dst_buffer_range(self.bitstream_buffer_size as u64);
 
         if is_reference {
             encode_info = encode_info.setup_reference_slot(&setup_reference_slot);

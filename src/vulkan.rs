@@ -286,10 +286,17 @@ impl VideoContext {
             let mut encode_codecs = Vec::new();
             if let Some(eq) = encode_queue {
                 // Get list of available device extensions
-                let available_extensions = unsafe {
-                    instance
-                        .enumerate_device_extension_properties(physical_device)
-                        .unwrap_or_default()
+                let available_extensions = match unsafe {
+                    instance.enumerate_device_extension_properties(physical_device)
+                } {
+                    Ok(exts) => exts,
+                    Err(e) => {
+                        warn!(
+                            "Failed to enumerate device extension properties for {}: {}. Skipping device.",
+                            device_name, e
+                        );
+                        continue;
+                    }
                 };
 
                 let has_extension = |name: &std::ffi::CStr| -> bool {
