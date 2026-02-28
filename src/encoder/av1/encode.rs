@@ -32,7 +32,7 @@ impl AV1Encoder {
                 vk::VideoEncodeRateControlModeFlagsKHR::DISABLED,
                 0,
                 0,
-                self.config.quality_level as u32,
+                self.config.quality_level,
             ),
             crate::encoder::RateControlMode::Cbr => (
                 vk::VideoEncodeRateControlModeFlagsKHR::CBR,

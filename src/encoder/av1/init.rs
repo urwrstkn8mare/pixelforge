@@ -11,7 +11,7 @@ use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
 use std::ptr;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 impl AV1Encoder {
     /// Create a new AV1 encoder.
@@ -27,6 +27,13 @@ impl AV1Encoder {
 
         let width = config.dimensions.width;
         let height = config.dimensions.height;
+
+        warn!(
+            "AV1 encoding is experimental. On NVIDIA GPUs, P-frames cannot reference other \
+             P-frames, causing all P-frames to reference the I-frame instead. This leads to \
+             progressively larger frame sizes over time. Consider using H.264 or HEVC until \
+             this is resolved."
+        );
 
         info!(
             "Creating AV1 encoder: requested {}x{}, pixel_format={:?}",
