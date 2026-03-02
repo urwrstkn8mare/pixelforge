@@ -222,8 +222,7 @@ pub struct EncodeConfig {
     /// IDR frames maximum headroom.
     pub initial_virtual_buffer_size_ms: u32,
     /// Color description for VUI signaling.
-    /// When set, the encoder will include VUI parameters in the bitstream
-    /// to signal the color space to decoders.
+    /// Defaults to BT.709 (full-range) when `None`.
     pub color_description: Option<ColorDescription>,
 }
 
@@ -797,6 +796,29 @@ mod tests {
         fn test_codec_variants() {
             assert_ne!(Codec::H264, Codec::H265);
             assert_ne!(Codec::H265, Codec::AV1);
+        }
+    }
+
+    // ColorDescription tests.
+    mod color_description_tests {
+        use super::*;
+
+        #[test]
+        fn test_bt709() {
+            let cd = ColorDescription::bt709();
+            assert_eq!(cd.color_primaries, 1);
+            assert_eq!(cd.transfer_characteristics, 1);
+            assert_eq!(cd.matrix_coefficients, 1);
+            assert!(cd.full_range);
+        }
+
+        #[test]
+        fn test_bt2020_pq() {
+            let cd = ColorDescription::bt2020_pq();
+            assert_eq!(cd.color_primaries, 9);
+            assert_eq!(cd.transfer_characteristics, 16);
+            assert_eq!(cd.matrix_coefficients, 9);
+            assert!(!cd.full_range);
         }
     }
 }

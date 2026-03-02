@@ -41,6 +41,9 @@ pub enum InputFormat {
     ABGR2101010,
     /// RGBA16F (64-bit, 16-bit float per channel).
     /// Maps to DRM_FORMAT_ABGR16161616F / VK_FORMAT_R16G16B16A16_SFLOAT.
+    ///
+    /// Expected input is linear-light scRGB where 1.0 = 80 nits.
+    /// The converter applies the PQ (ST 2084) transfer function internally.
     RGBA16F,
 }
 
@@ -124,6 +127,7 @@ impl OutputFormat {
 
 /// Configuration for the color converter.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ColorConverterConfig {
     /// Input frame width.
     pub width: u32,
@@ -136,6 +140,28 @@ pub struct ColorConverterConfig {
     /// Color space for the RGB→YUV matrix.
     /// Use Bt709 for SDR, Bt2020 for HDR.
     pub color_space: ColorSpace,
+    /// Full range (0-255 luma) or limited/studio range (16-235 luma).
+    /// Must match the `full_range` flag in `ColorDescription` for correct playback.
+    pub full_range: bool,
+}
+
+impl ColorConverterConfig {
+    /// Create a new configuration with BT.709 color space and full range.
+    pub fn new(
+        width: u32,
+        height: u32,
+        input_format: InputFormat,
+        output_format: OutputFormat,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            input_format,
+            output_format,
+            color_space: ColorSpace::Bt709,
+            full_range: true,
+        }
+    }
 }
 
 /// GPU-based color format converter.
@@ -587,13 +613,14 @@ impl ColorConverter {
                 &[],
             );
 
-            // Push constants: width, height, input_format, output_format, color_space.
-            let push_constants: [u32; 5] = [
+            // Push constants: width, height, input_format, output_format, color_space, full_range.
+            let push_constants: [u32; 6] = [
                 self.config.width,
                 self.config.height,
                 self.config.input_format as u32,
                 self.config.output_format as u32,
                 self.config.color_space as u32,
+                self.config.full_range as u32,
             ];
             let push_constants_bytes: &[u8] = std::slice::from_raw_parts(
                 push_constants.as_ptr() as *const u8,
@@ -933,6 +960,7 @@ mod tests {
             input_format: InputFormat::BGRx,
             output_format: OutputFormat::NV12,
             color_space: ColorSpace::Bt709,
+            full_range: true,
         };
 
         let cloned = config.clone();
@@ -941,6 +969,7 @@ mod tests {
         assert_eq!(cloned.input_format, InputFormat::BGRx);
         assert_eq!(cloned.output_format, OutputFormat::NV12);
         assert_eq!(cloned.color_space, ColorSpace::Bt709);
+        assert!(cloned.full_range);
     }
 
     #[test]
@@ -951,6 +980,7 @@ mod tests {
             input_format: InputFormat::RGBA,
             output_format: OutputFormat::I420,
             color_space: ColorSpace::Bt709,
+            full_range: true,
         };
 
         let debug_str = format!("{:?}", config);
@@ -991,6 +1021,7 @@ mod tests {
             input_format: InputFormat::BGRx,
             output_format: OutputFormat::NV12,
             color_space: ColorSpace::Bt709,
+            full_range: true,
         };
 
         let result = ColorConverter::new(context, config);
@@ -1024,6 +1055,7 @@ mod tests {
                     input_format: *input_format,
                     output_format: *output_format,
                     color_space: ColorSpace::Bt709,
+                    full_range: true,
                 };
 
                 let result = ColorConverter::new(context.clone(), config);

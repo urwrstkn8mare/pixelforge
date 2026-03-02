@@ -379,44 +379,43 @@ impl H265Encoder {
         };
 
         // SPS flags
-        let vui_present = config.color_description.is_some();
         let sps_flags = ash::vk::native::StdVideoH265SpsFlags {
             _bitfield_align_1: [],
             _bitfield_1: ash::vk::native::StdVideoH265SpsFlags::new_bitfield_1(
                 1,                                           // sps_temporal_id_nesting_flag
                 0,                                           // separate_colour_plane_flag
                 if conformance_window_flag { 1 } else { 0 }, // conformance_window_flag
-                1,                               // sps_sub_layer_ordering_info_present_flag
-                0,                               // scaling_list_enabled_flag
-                0,                               // sps_scaling_list_data_present_flag
-                1,                               // amp_enabled_flag (asymmetric motion partitions)
-                1,                               // sample_adaptive_offset_enabled_flag
-                0,                               // pcm_enabled_flag
-                0,                               // pcm_loop_filter_disabled_flag
-                0,                               // long_term_ref_pics_present_flag
-                0,                               // sps_temporal_mvp_enabled_flag
-                0,                               // strong_intra_smoothing_enabled_flag
-                if vui_present { 1 } else { 0 }, // vui_parameters_present_flag
-                0,                               // sps_extension_present_flag
-                0,                               // sps_range_extension_flag
-                0,                               // transform_skip_rotation_enabled_flag
-                0,                               // transform_skip_context_enabled_flag
-                0,                               // implicit_rdpcm_enabled_flag
-                0,                               // explicit_rdpcm_enabled_flag
-                0,                               // extended_precision_processing_flag
-                0,                               // intra_smoothing_disabled_flag
-                0,                               // high_precision_offsets_enabled_flag
-                0,                               // persistent_rice_adaptation_enabled_flag
-                0,                               // cabac_bypass_alignment_enabled_flag
-                0,                               // sps_scc_extension_flag
-                0,                               // sps_curr_pic_ref_enabled_flag
-                0,                               // palette_mode_enabled_flag
-                0,                               // sps_palette_predictor_initializers_present_flag
-                0,                               // intra_boundary_filtering_disabled_flag
+                1, // sps_sub_layer_ordering_info_present_flag
+                0, // scaling_list_enabled_flag
+                0, // sps_scaling_list_data_present_flag
+                1, // amp_enabled_flag (asymmetric motion partitions)
+                1, // sample_adaptive_offset_enabled_flag
+                0, // pcm_enabled_flag
+                0, // pcm_loop_filter_disabled_flag
+                0, // long_term_ref_pics_present_flag
+                0, // sps_temporal_mvp_enabled_flag
+                0, // strong_intra_smoothing_enabled_flag
+                1, // vui_parameters_present_flag
+                0, // sps_extension_present_flag
+                0, // sps_range_extension_flag
+                0, // transform_skip_rotation_enabled_flag
+                0, // transform_skip_context_enabled_flag
+                0, // implicit_rdpcm_enabled_flag
+                0, // explicit_rdpcm_enabled_flag
+                0, // extended_precision_processing_flag
+                0, // intra_smoothing_disabled_flag
+                0, // high_precision_offsets_enabled_flag
+                0, // persistent_rice_adaptation_enabled_flag
+                0, // cabac_bypass_alignment_enabled_flag
+                0, // sps_scc_extension_flag
+                0, // sps_curr_pic_ref_enabled_flag
+                0, // palette_mode_enabled_flag
+                0, // sps_palette_predictor_initializers_present_flag
+                0, // intra_boundary_filtering_disabled_flag
             ),
         };
 
-        // Build VUI structure when color description is provided.
+        // Build VUI structure. Defaults to BT.709 when no color description is set.
         let color_desc = config
             .color_description
             .unwrap_or(ColorDescription::bt709());
@@ -537,7 +536,7 @@ impl H265Encoder {
             pScalingLists: ptr::null(),
             pShortTermRefPicSet: ptr::null(),
             pLongTermRefPicsSps: ptr::null(),
-            pSequenceParameterSetVui: if vui_present { &vui } else { ptr::null() },
+            pSequenceParameterSetVui: &vui,
             pPredictorPaletteEntries: ptr::null(),
         };
 
