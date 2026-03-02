@@ -14,6 +14,16 @@ use crate::vulkan::VideoContext;
 use ash::vk;
 use tracing::debug;
 
+/// Color space for RGB→YUV conversion matrix selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorSpace {
+    /// BT.709 (standard SDR). Used for all HD/UHD SDR content.
+    #[default]
+    Bt709,
+    /// BT.2020 (HDR / wide color gamut).
+    Bt2020,
+}
+
 /// Supported input pixel formats for color conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::upper_case_acronyms)]
@@ -26,12 +36,35 @@ pub enum InputFormat {
     BGRA,
     /// RGBA (32-bit, red first, alpha last).
     RGBA,
+    /// ABGR2101010 (packed 10-bit per channel, 2-bit alpha).
+    /// Maps to DRM_FORMAT_ABGR2101010 / VK_FORMAT_A2B10G10R10_UNORM_PACK32.
+    ABGR2101010,
+    /// RGBA16F (64-bit, 16-bit float per channel).
+    /// Maps to DRM_FORMAT_ABGR16161616F / VK_FORMAT_R16G16B16A16_SFLOAT.
+    RGBA16F,
 }
 
 impl InputFormat {
     /// Bytes per pixel for this format.
     pub fn bytes_per_pixel(&self) -> usize {
-        4 // All current formats are 32-bit
+        match self {
+            InputFormat::BGRx
+            | InputFormat::RGBx
+            | InputFormat::BGRA
+            | InputFormat::RGBA
+            | InputFormat::ABGR2101010 => 4,
+            InputFormat::RGBA16F => 8,
+        }
+    }
+
+    /// Vulkan format for creating image views of this input format.
+    pub fn vk_format(&self) -> vk::Format {
+        match self {
+            InputFormat::BGRx | InputFormat::BGRA => vk::Format::B8G8R8A8_UNORM,
+            InputFormat::RGBx | InputFormat::RGBA => vk::Format::R8G8B8A8_UNORM,
+            InputFormat::ABGR2101010 => vk::Format::A2B10G10R10_UNORM_PACK32,
+            InputFormat::RGBA16F => vk::Format::R16G16B16A16_SFLOAT,
+        }
     }
 }
 
@@ -100,6 +133,9 @@ pub struct ColorConverterConfig {
     pub input_format: InputFormat,
     /// Output YUV format.
     pub output_format: OutputFormat,
+    /// Color space for the RGB→YUV matrix.
+    /// Use Bt709 for SDR, Bt2020 for HDR.
+    pub color_space: ColorSpace,
 }
 
 /// GPU-based color format converter.
@@ -551,12 +587,13 @@ impl ColorConverter {
                 &[],
             );
 
-            // Push constants: width, height, input_format, output_format.
-            let push_constants: [u32; 4] = [
+            // Push constants: width, height, input_format, output_format, color_space.
+            let push_constants: [u32; 5] = [
                 self.config.width,
                 self.config.height,
                 self.config.input_format as u32,
                 self.config.output_format as u32,
+                self.config.color_space as u32,
             ];
             let push_constants_bytes: &[u8] = std::slice::from_raw_parts(
                 push_constants.as_ptr() as *const u8,
@@ -718,7 +755,7 @@ impl ColorConverter {
         let view_info = vk::ImageViewCreateInfo::default()
             .image(src_image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::B8G8R8A8_UNORM)
+            .format(self.config.input_format.vk_format())
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
@@ -779,6 +816,8 @@ mod tests {
         assert_eq!(InputFormat::RGBx.bytes_per_pixel(), 4);
         assert_eq!(InputFormat::BGRA.bytes_per_pixel(), 4);
         assert_eq!(InputFormat::RGBA.bytes_per_pixel(), 4);
+        assert_eq!(InputFormat::ABGR2101010.bytes_per_pixel(), 4);
+        assert_eq!(InputFormat::RGBA16F.bytes_per_pixel(), 8);
     }
 
     #[test]
@@ -788,6 +827,24 @@ mod tests {
         assert_eq!(InputFormat::RGBx as u32, 1);
         assert_eq!(InputFormat::BGRA as u32, 2);
         assert_eq!(InputFormat::RGBA as u32, 3);
+        assert_eq!(InputFormat::ABGR2101010 as u32, 4);
+        assert_eq!(InputFormat::RGBA16F as u32, 5);
+    }
+
+    #[test]
+    fn test_input_format_vk_format() {
+        assert_eq!(InputFormat::BGRx.vk_format(), vk::Format::B8G8R8A8_UNORM);
+        assert_eq!(InputFormat::BGRA.vk_format(), vk::Format::B8G8R8A8_UNORM);
+        assert_eq!(InputFormat::RGBx.vk_format(), vk::Format::R8G8B8A8_UNORM);
+        assert_eq!(InputFormat::RGBA.vk_format(), vk::Format::R8G8B8A8_UNORM);
+        assert_eq!(
+            InputFormat::ABGR2101010.vk_format(),
+            vk::Format::A2B10G10R10_UNORM_PACK32
+        );
+        assert_eq!(
+            InputFormat::RGBA16F.vk_format(),
+            vk::Format::R16G16B16A16_SFLOAT
+        );
     }
 
     // ========================
@@ -875,6 +932,7 @@ mod tests {
             height: 1080,
             input_format: InputFormat::BGRx,
             output_format: OutputFormat::NV12,
+            color_space: ColorSpace::Bt709,
         };
 
         let cloned = config.clone();
@@ -882,6 +940,7 @@ mod tests {
         assert_eq!(cloned.height, 1080);
         assert_eq!(cloned.input_format, InputFormat::BGRx);
         assert_eq!(cloned.output_format, OutputFormat::NV12);
+        assert_eq!(cloned.color_space, ColorSpace::Bt709);
     }
 
     #[test]
@@ -891,6 +950,7 @@ mod tests {
             height: 480,
             input_format: InputFormat::RGBA,
             output_format: OutputFormat::I420,
+            color_space: ColorSpace::Bt709,
         };
 
         let debug_str = format!("{:?}", config);
@@ -930,6 +990,7 @@ mod tests {
             height: 64,
             input_format: InputFormat::BGRx,
             output_format: OutputFormat::NV12,
+            color_space: ColorSpace::Bt709,
         };
 
         let result = ColorConverter::new(context, config);
@@ -962,6 +1023,7 @@ mod tests {
                     height: 32,
                     input_format: *input_format,
                     output_format: *output_format,
+                    color_space: ColorSpace::Bt709,
                 };
 
                 let result = ColorConverter::new(context.clone(), config);

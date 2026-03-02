@@ -1,12 +1,13 @@
 //! Compute shader for color format conversion.
 //!
 //! This module contains the SPIR-V bytecode for the color conversion compute shader.
-//! The shader converts RGB/BGR formats to various YUV formats using BT.601 coefficients.
+//! The shader converts RGB/BGR formats to various YUV formats using BT.709 (SDR)
+//! or BT.2020 (HDR) coefficients, selected via push constants.
 
 /// Get the SPIR-V bytecode for the color conversion shader.
 ///
 /// The shader expects:
-/// - Push constants: width (u32), height (u32), input_format (u32), output_format (u32)
+/// - Push constants: width (u32), height (u32), input_format (u32), output_format (u32), color_space (u32)
 /// - Binding 0: Input buffer (RGB/BGR data)
 /// - Binding 1: Output buffer (YUV data)
 ///
@@ -23,6 +24,7 @@ pub fn get_spirv_code() -> Vec<u32> {
     //     uint height;
     //     uint input_format;   // 0=BGRx, 1=RGBx, 2=BGRA, 3=RGBA
     //     uint output_format;  // 0=NV12, 1=I420, 2=YUV444
+    //     uint color_space;    // 0=BT.709, 1=BT.2020
     // } params;
     //
     // layout(std430, binding = 0) readonly buffer InputBuffer {
@@ -33,16 +35,16 @@ pub fn get_spirv_code() -> Vec<u32> {
     //     uint output_data[];
     // };
     //
-    // // BT.601 conversion coefficients
-    // const float Y_R = 0.299;
-    // const float Y_G = 0.587;
-    // const float Y_B = 0.114;
-    // const float U_R = -0.169;
-    // const float U_G = -0.331;
+    // // BT.709 conversion coefficients (default for SDR)
+    // const float Y_R = 0.2126;
+    // const float Y_G = 0.7152;
+    // const float Y_B = 0.0722;
+    // const float U_R = -0.1146;
+    // const float U_G = -0.3854;
     // const float U_B = 0.500;
     // const float V_R = 0.500;
-    // const float V_G = -0.419;
-    // const float V_B = -0.081;
+    // const float V_G = -0.4542;
+    // const float V_B = -0.0458;
     //
     // vec3 extract_rgb(uint pixel, uint format) {
     //     uint b0 = (pixel >> 0) & 0xFF;
@@ -152,8 +154,9 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(push_constant) uniform PushConstants {
     uint width;
     uint height;
-    uint input_format;   // 0=BGRx, 1=RGBx, 2=BGRA, 3=RGBA (unused with texelFetch swizzle)
+    uint input_format;   // 0=BGRx, 1=RGBx, 2=BGRA, 3=RGBA, 4=ABGR2101010, 5=RGBA16F
     uint output_format;  // 0=NV12, 1=I420, 2=YUV444, 3=P010, 4=YUV444P10
+    uint color_space;    // 0=BT.709, 1=BT.2020
 } params;
 
 // Source image sampled directly — eliminates the image-to-buffer copy.
@@ -163,27 +166,76 @@ layout(std430, binding = 1) buffer OutputBuffer {
     uint output_data[];
 };
 
-// BT.601 conversion coefficients.
-const float Y_R = 0.299;
-const float Y_G = 0.587;
-const float Y_B = 0.114;
-const float U_R = -0.169;
-const float U_G = -0.331;
-const float U_B = 0.500;
-const float V_R = 0.500;
-const float V_G = -0.419;
-const float V_B = -0.081;
+// BT.709 conversion coefficients (SDR).
+const float BT709_Y_R = 0.2126;
+const float BT709_Y_G = 0.7152;
+const float BT709_Y_B = 0.0722;
+const float BT709_U_R = -0.1146;
+const float BT709_U_G = -0.3854;
+const float BT709_U_B = 0.5000;
+const float BT709_V_R = 0.5000;
+const float BT709_V_G = -0.4542;
+const float BT709_V_B = -0.0458;
 
-// Read RGB from source image via texelFetch (Vulkan format handles BGRA→RGBA swizzle).
+// BT.2020 conversion coefficients (HDR).
+const float BT2020_Y_R = 0.2627;
+const float BT2020_Y_G = 0.6780;
+const float BT2020_Y_B = 0.0593;
+const float BT2020_U_R = -0.1396;
+const float BT2020_U_G = -0.3604;
+const float BT2020_U_B = 0.5000;
+const float BT2020_V_R = 0.5000;
+const float BT2020_V_G = -0.4598;
+const float BT2020_V_B = -0.0402;
+
+// PQ (ST 2084) constants for inverse EOTF.
+const float PQ_M1 = 0.1593017578125;
+const float PQ_M2 = 78.84375;
+const float PQ_C1 = 0.8359375;
+const float PQ_C2 = 18.8515625;
+const float PQ_C3 = 18.6875;
+
+// Apply PQ inverse EOTF: linear light [0,1] → PQ signal [0,1].
+// Input should be normalized to [0,1] where 1.0 = 10,000 nits.
+vec3 linear_to_pq(vec3 L) {
+    L = max(L, vec3(0.0));
+    vec3 Lm1 = pow(L, vec3(PQ_M1));
+    vec3 N = pow((PQ_C1 + PQ_C2 * Lm1) / (1.0 + PQ_C3 * Lm1), vec3(PQ_M2));
+    return N;
+}
+
+// Read RGB from source image via texelFetch.
+// Returns values in [0, 255] range for all formats.
+// For RGBA16F (HDR), applies PQ transfer function to map linear-light to [0, 255].
 vec3 read_rgb(ivec2 coord) {
     vec4 rgba = texelFetch(inputImage, coord, 0);
+    if (params.input_format == 5u) {
+        // RGBA16F: values are linear-light floats, potentially > 1.0.
+        // Normalize assuming 1.0 = 80 nits (sRGB reference white),
+        // so divide by 125 to get PQ input range [0,1] where 1.0 = 10000 nits.
+        vec3 pq = linear_to_pq(rgba.rgb / 125.0);
+        return pq * 255.0;
+    }
+    // UNORM formats (8-bit and 10-bit): texelFetch returns [0.0, 1.0].
     return rgba.rgb * 255.0;
 }
 
 vec3 rgb_to_yuv(vec3 rgb) {
-    float y = Y_R * rgb.r + Y_G * rgb.g + Y_B * rgb.b;
-    float u = 128.0 + U_R * rgb.r + U_G * rgb.g + U_B * rgb.b;
-    float v = 128.0 + V_R * rgb.r + V_G * rgb.g + V_B * rgb.b;
+    float yr, yg, yb, ur, ug, ub, vr, vg, vb;
+    if (params.color_space == 1u) {
+        // BT.2020
+        yr = BT2020_Y_R; yg = BT2020_Y_G; yb = BT2020_Y_B;
+        ur = BT2020_U_R; ug = BT2020_U_G; ub = BT2020_U_B;
+        vr = BT2020_V_R; vg = BT2020_V_G; vb = BT2020_V_B;
+    } else {
+        // BT.709 (default)
+        yr = BT709_Y_R; yg = BT709_Y_G; yb = BT709_Y_B;
+        ur = BT709_U_R; ug = BT709_U_G; ub = BT709_U_B;
+        vr = BT709_V_R; vg = BT709_V_G; vb = BT709_V_B;
+    }
+    float y = yr * rgb.r + yg * rgb.g + yb * rgb.b;
+    float u = 128.0 + ur * rgb.r + ug * rgb.g + ub * rgb.b;
+    float v = 128.0 + vr * rgb.r + vg * rgb.g + vb * rgb.b;
     return vec3(clamp(y, 0.0, 255.0), clamp(u, 0.0, 255.0), clamp(v, 0.0, 255.0));
 }
 
