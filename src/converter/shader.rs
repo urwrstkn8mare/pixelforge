@@ -40,7 +40,7 @@ layout(push_constant) uniform PushConstants {
     uint height;
     uint input_format;   // 0=BGRx, 1=RGBx, 2=BGRA, 3=RGBA, 4=ABGR2101010, 5=RGBA16F
     uint output_format;  // 0=NV12, 1=I420, 2=YUV444, 3=P010, 4=YUV444P10
-    uint color_space;    // 0=BT.709, 1=BT.2020
+    uint color_space;    // 0=BT.709, 1=BT.2020, 2=sRGB→BT.2020+PQ
     uint full_range;     // 0=limited/studio range, 1=full range
 } params;
 
@@ -89,19 +89,50 @@ vec3 linear_to_pq(vec3 L) {
     return N;
 }
 
+// Inverse sRGB EOTF: sRGB gamma-encoded [0,1] → linear light [0,1].
+// Uses the standard piecewise sRGB transfer function.
+vec3 srgb_to_linear(vec3 srgb) {
+    // Clamp to [0,1] to avoid NaN from pow() on negative/out-of-range FP16 inputs.
+    srgb = clamp(srgb, 0.0, 1.0);
+    // sRGB piecewise: linear below 0.04045, gamma above.
+    return mix(
+        pow((srgb + 0.055) / 1.055, vec3(2.4)),
+        srgb / 12.92,
+        lessThanEqual(srgb, vec3(0.04045))
+    );
+}
+
+// BT.709 to BT.2020 gamut mapping matrix (applied in linear light).
+// Derived from the BT.709 and BT.2020 primaries via the CIE XYZ intermediate.
+vec3 bt709_to_bt2020(vec3 rgb709) {
+    return vec3(
+        0.6274 * rgb709.r + 0.3293 * rgb709.g + 0.0433 * rgb709.b,
+        0.0691 * rgb709.r + 0.9195 * rgb709.g + 0.0114 * rgb709.b,
+        0.0164 * rgb709.r + 0.0880 * rgb709.g + 0.8956 * rgb709.b
+    );
+}
+
 // Read normalized RGB from source image via texelFetch.
-// Returns values in [0, 1] range for all formats.
-// For RGBA16F (HDR), applies PQ transfer function to map linear-light to [0, 1].
+// Returns values in [0, 1] range representing the final signal level for YUV conversion.
+//
+// The compositor (Smithay) does NOT perform color-managed compositing: it blits
+// client textures to the GBM output without applying any transfer function.
+// Therefore the GBM buffer preserves the source's encoding:
+//   - PQ surfaces → PQ-encoded values (even in FP16)
+//   - sRGB surfaces → sRGB gamma-encoded values (even in FP16)
+//
+// color_space 0 (BT.709) and 1 (BT.2020): passthrough — data is already encoded.
+// color_space 2 (sRGB→BT.2020+PQ): decode sRGB, convert gamut, apply PQ.
 vec3 read_rgb(ivec2 coord) {
     vec4 rgba = texelFetch(inputImage, coord, 0);
-    if (params.input_format == 5u) {
-        // RGBA16F: linear-light floats in scene-referred scRGB scale
-        // where 1.0 = 80 nits (the sRGB / scRGB reference white).
-        // PQ EOTF input must be absolute luminance normalized to [0, 1]
-        // where 1.0 = 10 000 nits, hence the factor 10000 / 80 = 125.
-        return linear_to_pq(rgba.rgb / 125.0);
+    if (params.color_space == 2u) {
+        // sRGB→BT.2020+PQ: decode sRGB gamma → linear BT.709 → BT.2020 gamut → PQ.
+        vec3 linear_709 = srgb_to_linear(rgba.rgb);
+        vec3 linear_2020 = bt709_to_bt2020(linear_709);
+        // SDR reference white at 203 nits (ITU-R BT.2408) → normalize to PQ's 10000 nit scale.
+        return linear_to_pq(linear_2020 * (203.0 / 10000.0));
     }
-    // UNORM formats (8-bit and 10-bit): texelFetch returns [0.0, 1.0].
+    // BT.709 or BT.2020 passthrough: values are already properly encoded.
     return rgba.rgb;
 }
 
@@ -109,8 +140,8 @@ vec3 read_rgb(ivec2 coord) {
 // Returns Y in [0, 1], U and V in [0, 1] centered at 0.5.
 vec3 rgb_to_yuv(vec3 rgb) {
     float yr, yg, yb, ur, ug, ub, vr, vg, vb;
-    if (params.color_space == 1u) {
-        // BT.2020
+    if (params.color_space >= 1u) {
+        // BT.2020 (also used for sRGB→BT.2020+PQ, since read_rgb already converted).
         yr = BT2020_Y_R; yg = BT2020_Y_G; yb = BT2020_Y_B;
         ur = BT2020_U_R; ug = BT2020_U_G; ub = BT2020_U_B;
         vr = BT2020_V_R; vg = BT2020_V_G; vb = BT2020_V_B;
