@@ -10,6 +10,14 @@ cargo test
 cargo run --example encode_h264
 ```
 
+## README Generation
+The `README.md` is generated from the doc comments in `src/lib.rs` using the `README.tpl` template.
+To regenerate:
+```bash
+cargo readme --no-title --no-indent-headings > README.md
+```
+Do not edit `README.md` directly; update the doc comments in `src/lib.rs` instead.
+
 To verify the quality of the encoded videos, run:
 
 ```bash

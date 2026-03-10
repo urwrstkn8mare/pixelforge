@@ -140,10 +140,14 @@ Supported input formats: BGRx, RGBx, BGRA, RGBA, ABGR2101010 (10-bit packed), RG
 Supported output formats: NV12 (8-bit), I420 (8-bit), YUV444 (8-bit), P010 (10-bit), YUV444P10 (10-bit).
 
 ```rust
-use pixelforge::{ColorConverter, ColorConverterConfig, ColorSpace, InputFormat, OutputFormat};
+use pixelforge::{ColorConverter, ColorConverterConfig, ColorSpace, InputFormat, OutputFormat, VideoContextBuilder};
 
-let config = ColorConverterConfig::new(1920, 1080, InputFormat::BGRx, OutputFormat::NV12)
-    .with_color_space(ColorSpace::Bt709);
+let context = VideoContextBuilder::new()
+    .app_name("Color Converter")
+    .build()?;
+
+let mut config = ColorConverterConfig::new(1920, 1080, InputFormat::BGRx, OutputFormat::NV12);
+config.color_space = ColorSpace::SrgbToBt2020Pq;
 
 let mut converter = ColorConverter::new(context.clone(), config)?;
 // converter.convert(input_image, output_buffer)?;
@@ -178,5 +182,10 @@ cargo run --example verify_all
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## Acknowledgement
+
+This project was heavily inspired by the [vk_video_samples](https://github.com/nvpro-samples/vk_video_samples)
+repository by NVIDIA, which provided invaluable reference for Vulkan Video encoding.
 
 License: BSD-2-Clause
