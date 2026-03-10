@@ -126,6 +126,64 @@ impl AV1Encoder {
 // thread and is properly synchronized via Vulkan fences before access
 unsafe impl Send for AV1Encoder {}
 
+impl Drop for AV1Encoder {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.context.device().device_wait_idle();
+            self.context
+                .device()
+                .destroy_query_pool(self.query_pool, None);
+            self.context.device().destroy_fence(self.upload_fence, None);
+            self.context.device().destroy_fence(self.encode_fence, None);
+            self.context
+                .device()
+                .destroy_command_pool(self.command_pool, None);
+            if self.upload_command_pool != self.command_pool {
+                self.context
+                    .device()
+                    .destroy_command_pool(self.upload_command_pool, None);
+            }
+            self.context
+                .device()
+                .destroy_buffer(self.bitstream_buffer, None);
+            // Unmap the persistently mapped bitstream buffer before freeing memory.
+            self.context
+                .device()
+                .unmap_memory(self.bitstream_buffer_memory);
+            self.context
+                .device()
+                .free_memory(self.bitstream_buffer_memory, None);
+            self.context
+                .device()
+                .destroy_image_view(self.input_image_view, None);
+            self.context.device().destroy_image(self.input_image, None);
+            self.context
+                .device()
+                .free_memory(self.input_image_memory, None);
+
+            for i in 0..self.dpb_images.len() {
+                self.context
+                    .device()
+                    .destroy_image_view(self.dpb_image_views[i], None);
+                self.context
+                    .device()
+                    .destroy_image(self.dpb_images[i], None);
+                self.context
+                    .device()
+                    .free_memory(self.dpb_image_memories[i], None);
+            }
+
+            self.video_queue_fn
+                .destroy_video_session_parameters(self.session_params, None);
+            self.video_queue_fn
+                .destroy_video_session(self.session, None);
+            for mem in &self.session_memory {
+                self.context.device().free_memory(*mem, None);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,63 +521,5 @@ mod tests {
         }
         current_dpb_slot = find_free_slot(&references, dpb_slot_count);
         assert_eq!(current_dpb_slot, 1); // ping-pong back
-    }
-}
-
-impl Drop for AV1Encoder {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = self.context.device().device_wait_idle();
-            self.context
-                .device()
-                .destroy_query_pool(self.query_pool, None);
-            self.context.device().destroy_fence(self.upload_fence, None);
-            self.context.device().destroy_fence(self.encode_fence, None);
-            self.context
-                .device()
-                .destroy_command_pool(self.command_pool, None);
-            if self.upload_command_pool != self.command_pool {
-                self.context
-                    .device()
-                    .destroy_command_pool(self.upload_command_pool, None);
-            }
-            self.context
-                .device()
-                .destroy_buffer(self.bitstream_buffer, None);
-            // Unmap the persistently mapped bitstream buffer before freeing memory.
-            self.context
-                .device()
-                .unmap_memory(self.bitstream_buffer_memory);
-            self.context
-                .device()
-                .free_memory(self.bitstream_buffer_memory, None);
-            self.context
-                .device()
-                .destroy_image_view(self.input_image_view, None);
-            self.context.device().destroy_image(self.input_image, None);
-            self.context
-                .device()
-                .free_memory(self.input_image_memory, None);
-
-            for i in 0..self.dpb_images.len() {
-                self.context
-                    .device()
-                    .destroy_image_view(self.dpb_image_views[i], None);
-                self.context
-                    .device()
-                    .destroy_image(self.dpb_images[i], None);
-                self.context
-                    .device()
-                    .free_memory(self.dpb_image_memories[i], None);
-            }
-
-            self.video_queue_fn
-                .destroy_video_session_parameters(self.session_params, None);
-            self.video_queue_fn
-                .destroy_video_session(self.session, None);
-            for mem in &self.session_memory {
-                self.context.device().free_memory(*mem, None);
-            }
-        }
     }
 }

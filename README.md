@@ -15,8 +15,11 @@ A Vulkan-based video encoding library for Rust, supporting H.264, H.265, and AV1
 
 - **Hardware-accelerated** video encoding using Vulkan Video extensions.
 - **Multiple codec support**: H.264/AVC, H.265/HEVC, AV1.
+- **GPU color conversion**: RGB/BGR → YUV via Vulkan compute shaders (BT.709, BT.2020, sRGB→BT.2020+PQ).
+- **HDR support**: 10-bit encoding (P010, YUV444P10), PQ transfer function, BT.2020 color space.
 - **GPU-native API**: Encode directly from Vulkan images (`vk::Image`).
 - **Flexible configuration**: Rate control (CBR, VBR, CQP), quality levels, GOP settings.
+- **Multiple input formats**: BGRx, RGBx, BGRA, RGBA, ABGR2101010 (10-bit packed), RGBA16F (FP16).
 - **Utility helpers**: [`InputImage`] for easy YUV data upload to GPU.
 - **Optional DMA-BUF support**: Zero-copy image import from external processes (Linux only).
 
@@ -123,6 +126,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Color Conversion (RGB → YUV)
+
+PixelForge includes a GPU compute shader for converting RGB input to YUV output, supporting multiple color spaces:
+
+| Color Space | Description |
+|-------------|-------------|
+| `Bt709` | Standard SDR (BT.709 coefficients) |
+| `Bt2020` | HDR passthrough (BT.2020 coefficients, PQ-encoded input) |
+| `SrgbToBt2020Pq` | SDR-in-HDR (sRGB → linear → BT.2020 gamut → PQ OETF) |
+
+Supported input formats: BGRx, RGBx, BGRA, RGBA, ABGR2101010 (10-bit packed), RGBA16F (FP16).
+Supported output formats: NV12 (8-bit), I420 (8-bit), YUV444 (8-bit), P010 (10-bit), YUV444P10 (10-bit).
+
+```rust
+use pixelforge::{ColorConverter, ColorConverterConfig, ColorSpace, InputFormat, OutputFormat};
+
+let config = ColorConverterConfig::new(1920, 1080, InputFormat::BGRx, OutputFormat::NV12)
+    .with_color_space(ColorSpace::Bt709);
+
+let mut converter = ColorConverter::new(context.clone(), config)?;
+// converter.convert(input_image, output_buffer)?;
+```
+
 ## Examples
 
 Run the examples with:
@@ -139,6 +165,9 @@ cargo run --example encode_h265
 
 # AV1 encoding example
 cargo run --example encode_av1
+
+# Verify all codecs and formats
+cargo run --example verify_all
 ```
 
 ## TODO's
