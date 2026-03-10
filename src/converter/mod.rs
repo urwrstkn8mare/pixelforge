@@ -22,6 +22,10 @@ pub enum ColorSpace {
     Bt709,
     /// BT.2020 (HDR / wide color gamut).
     Bt2020,
+    /// sRGB input converted to BT.2020 + PQ output.
+    /// Used for SDR content during HDR streaming sessions.
+    /// Applies: inverse sRGB EOTF → BT.709→BT.2020 gamut mapping → PQ OETF.
+    SrgbToBt2020Pq,
 }
 
 /// Supported input pixel formats for color conversion.
@@ -42,8 +46,11 @@ pub enum InputFormat {
     /// RGBA16F (64-bit, 16-bit float per channel).
     /// Maps to DRM_FORMAT_ABGR16161616F / VK_FORMAT_R16G16B16A16_SFLOAT.
     ///
-    /// Expected input is linear-light scRGB where 1.0 = 80 nits.
-    /// The converter applies the PQ (ST 2084) transfer function internally.
+    /// The converter treats FP16 data the same as other formats: passthrough
+    /// for `ColorSpace::Bt709` / `Bt2020`, and sRGB→BT.2020+PQ conversion
+    /// for `ColorSpace::SrgbToBt2020Pq`. No linear→PQ transfer function is
+    /// applied automatically; if the source is PQ-encoded (e.g. via the
+    /// gamescope WSI layer), use `ColorSpace::Bt2020` for passthrough.
     RGBA16F,
 }
 
@@ -214,6 +221,14 @@ impl ColorConverter {
     /// This is useful for direct GPU-to-GPU transfers.
     pub fn output_buffer(&self) -> vk::Buffer {
         self.output_buffer
+    }
+
+    /// Set the color space for subsequent conversions.
+    ///
+    /// This takes effect on the next `convert()` call without recreating the pipeline,
+    /// since the color space is passed via push constants.
+    pub fn set_color_space(&mut self, color_space: ColorSpace) {
+        self.config.color_space = color_space;
     }
 
     /// Build buffer-to-image copy regions for multi-planar YUV formats.
@@ -872,6 +887,19 @@ mod tests {
             InputFormat::RGBA16F.vk_format(),
             vk::Format::R16G16B16A16_SFLOAT
         );
+    }
+
+    // ========================
+    // ColorSpace tests.
+    // ========================
+
+    #[test]
+    fn test_color_space_enum_values() {
+        // Verify enum values match shader push constant expectations:
+        // 0=BT.709, 1=BT.2020, 2=sRGB→BT.2020+PQ.
+        assert_eq!(ColorSpace::Bt709 as u32, 0);
+        assert_eq!(ColorSpace::Bt2020 as u32, 1);
+        assert_eq!(ColorSpace::SrgbToBt2020Pq as u32, 2);
     }
 
     // ========================
