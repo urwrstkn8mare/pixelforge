@@ -42,6 +42,7 @@ layout(push_constant) uniform PushConstants {
     uint output_format;  // 0=NV12, 1=I420, 2=YUV444, 3=P010, 4=YUV444P10
     uint color_space;    // 0=BT.709, 1=BT.2020, 2=sRGB→BT.2020+PQ
     uint full_range;     // 0=limited/studio range, 1=full range
+    float sdr_white_nits; // SDR reference white (nits), used for sRGB→BT.2020+PQ
 } params;
 
 // Source image sampled directly — eliminates the image-to-buffer copy.
@@ -129,8 +130,9 @@ vec3 read_rgb(ivec2 coord) {
         // sRGB→BT.2020+PQ: decode sRGB gamma → linear BT.709 → BT.2020 gamut → PQ.
         vec3 linear_709 = srgb_to_linear(rgba.rgb);
         vec3 linear_2020 = bt709_to_bt2020(linear_709);
-        // SDR reference white at 203 nits (ITU-R BT.2408) → normalize to PQ's 10000 nit scale.
-        return linear_to_pq(linear_2020 * (203.0 / 10000.0));
+        // SDR reference white (configurable, default 203 nits per ITU-R BT.2408)
+        // normalized to PQ's 10000 nit scale.
+        return linear_to_pq(linear_2020 * (params.sdr_white_nits / 10000.0));
     }
     // BT.709 or BT.2020 passthrough: values are already properly encoded.
     return rgba.rgb;

@@ -160,6 +160,11 @@ pub struct ColorConverterConfig {
     /// Full range (0-255 luma) or limited/studio range (16-235 luma).
     /// Must match the `full_range` flag in `ColorDescription` for correct playback.
     pub full_range: bool,
+    /// SDR reference white level in nits for the sRGB→BT.2020+PQ conversion.
+    ///
+    /// Per ITU-R BT.2408 the standard value is 203 nits.
+    /// Only used when `color_space` is `SrgbToBt2020Pq`.
+    pub sdr_reference_white_nits: f32,
 }
 
 impl ColorConverterConfig {
@@ -177,6 +182,7 @@ impl ColorConverterConfig {
             output_format,
             color_space: ColorSpace::Bt709,
             full_range: true,
+            sdr_reference_white_nits: 203.0,
         }
     }
 }
@@ -631,14 +637,15 @@ impl ColorConverter {
                 &[],
             );
 
-            // Push constants: width, height, input_format, output_format, color_space, full_range.
-            let push_constants: [u32; 6] = [
+            // Push constants: width, height, input_format, output_format, color_space, full_range, sdr_white_nits.
+            let push_constants: [u32; 7] = [
                 self.config.width,
                 self.config.height,
                 self.config.input_format as u32,
                 self.config.output_format as u32,
                 self.config.color_space as u32,
                 self.config.full_range as u32,
+                self.config.sdr_reference_white_nits.to_bits(),
             ];
             let push_constants_bytes: &[u8] = std::slice::from_raw_parts(
                 push_constants.as_ptr() as *const u8,
@@ -992,6 +999,7 @@ mod tests {
             output_format: OutputFormat::NV12,
             color_space: ColorSpace::Bt709,
             full_range: true,
+            sdr_reference_white_nits: 203.0,
         };
 
         let cloned = config.clone();
@@ -1012,6 +1020,7 @@ mod tests {
             output_format: OutputFormat::I420,
             color_space: ColorSpace::Bt709,
             full_range: true,
+            sdr_reference_white_nits: 203.0,
         };
 
         let debug_str = format!("{:?}", config);
@@ -1053,6 +1062,7 @@ mod tests {
             output_format: OutputFormat::NV12,
             color_space: ColorSpace::Bt709,
             full_range: true,
+            sdr_reference_white_nits: 203.0,
         };
 
         let result = ColorConverter::new(context, config);
@@ -1087,6 +1097,7 @@ mod tests {
                     output_format: *output_format,
                     color_space: ColorSpace::Bt709,
                     full_range: true,
+                    sdr_reference_white_nits: 203.0,
                 };
 
                 let result = ColorConverter::new(context.clone(), config);
