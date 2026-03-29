@@ -488,11 +488,13 @@ pub(crate) fn create_command_resources(
     .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
     let upload_command_buffer = upload_command_buffers[0];
 
-    // Create fences.
+    // Create fences. The encode fence is created signaled so that
+    // set_color_description() can safely wait on it before the first encode.
     let fence_create_info = vk::FenceCreateInfo::default();
     let upload_fence = unsafe { context.device().create_fence(&fence_create_info, None) }
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-    let encode_fence = unsafe { context.device().create_fence(&fence_create_info, None) }
+    let signaled_fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+    let encode_fence = unsafe { context.device().create_fence(&signaled_fence_info, None) }
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
     Ok(CommandResources {
@@ -1328,12 +1330,13 @@ pub(crate) unsafe fn record_post_encode_dpb_barrier(
 
 /// Submit an encode command buffer and wait for completion.
 ///
-/// Submits the command buffer to the encode queue, waits for the fence, resets it,
+/// Submits the command buffer to the encode queue, waits for the fence,
 /// then reads query results and copies the encoded bitstream data.
+/// The fence is reset before submission so it may be in any state on entry.
 ///
 /// # Safety
 ///
-/// The command buffer must have been ended. The fence must be in the unsignaled state.
+/// The command buffer must have been ended.
 /// The bitstream buffer pointer must be valid and the buffer must be persistently mapped.
 pub(crate) unsafe fn submit_encode_and_read_bitstream(
     device: &ash::Device,
@@ -1346,6 +1349,14 @@ pub(crate) unsafe fn submit_encode_and_read_bitstream(
     let submit_info =
         vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
 
+    // Reset the fence before submit (it may be signaled from a previous encode
+    // or from initial creation with SIGNALED_BIT). This ensures the fence is
+    // unsignaled for queue_submit, and after wait_for_fences it stays signaled —
+    // which lets set_color_description() safely wait on it between encodes.
+    device
+        .reset_fences(&[fence])
+        .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
+
     device
         .queue_submit(encode_queue, &[submit_info], fence)
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
@@ -1353,10 +1364,6 @@ pub(crate) unsafe fn submit_encode_and_read_bitstream(
     device
         .wait_for_fences(&[fence], true, u64::MAX)
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
-
-    device
-        .reset_fences(&[fence])
-        .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
 
     // Read query results (offset + bytes_written).
     #[repr(C)]
