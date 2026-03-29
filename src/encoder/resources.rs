@@ -1156,11 +1156,13 @@ pub(crate) unsafe fn destroy_encoder_resources(
         device.free_memory(*memory, None);
     }
 
-    (video_queue_fn.fp().destroy_video_session_parameters_khr)(
-        device.handle(),
-        res.session_params,
-        std::ptr::null(),
-    );
+    if res.session_params != vk::VideoSessionParametersKHR::null() {
+        (video_queue_fn.fp().destroy_video_session_parameters_khr)(
+            device.handle(),
+            res.session_params,
+            std::ptr::null(),
+        );
+    }
     (video_queue_fn.fp().destroy_video_session_khr)(device.handle(), res.session, std::ptr::null());
 
     for memory in res.session_memory {
