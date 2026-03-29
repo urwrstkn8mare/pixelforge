@@ -671,7 +671,14 @@ pub(crate) fn clear_input_image(context: &VideoContext, params: &ClearImageParam
     };
 
     // Calculate per-plane sizes.
-    let plane0_size = params.width * params.height * bytes_per_component;
+    // For YUV444, align Y plane size to 4 bytes so the UV plane buffer offset
+    // meets VkBufferImageCopy::bufferOffset alignment requirements.
+    // YUV420/422 dimensions are always even, so alignment is naturally satisfied.
+    let plane0_raw = (params.width * params.height * bytes_per_component) as usize;
+    let plane0_size = match params.pixel_format {
+        PixelFormat::Yuv444 => crate::align4(plane0_raw) as u32,
+        _ => plane0_raw as u32,
+    };
     let plane1_size = match params.pixel_format {
         // YUV 4:2:0 (e.g., NV12): UV plane is half width, half height, 2 components per pixel.
         PixelFormat::Yuv420 => (params.width / 2) * (params.height / 2) * 2 * bytes_per_component,

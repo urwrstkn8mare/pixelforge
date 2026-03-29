@@ -198,20 +198,20 @@ void main() {
     uint pixel_count = params.width * params.height;
 
     if (params.output_format == 2u) {
-        // YUV444 8-bit: Full resolution, byte-packed into uints.
+        // YUV444 8-bit: 2-plane semi-planar (Y plane + UV interleaved).
         uint y_byte_idx = pixel_idx;
         uint y_word_idx = y_byte_idx / 4u;
         uint y_byte_offset = y_byte_idx % 4u;
         atomicOr(output_data[y_word_idx], q8_y(yuv.x) << (y_byte_offset * 8u));
 
-        uint u_base = pixel_count;
-        uint u_byte_idx = u_base + pixel_idx;
-        uint u_word_idx = u_byte_idx / 4u;
-        uint u_byte_offset = u_byte_idx % 4u;
-        atomicOr(output_data[u_word_idx], q8_c(yuv.y) << (u_byte_offset * 8u));
+        // Align UV plane offset to 4 bytes for VkBufferImageCopy compliance.
+        uint uv_base = (pixel_count + 3u) & ~3u;
+        uint uv_byte_idx = uv_base + pixel_idx * 2u;
+        uint uv_word_idx = uv_byte_idx / 4u;
+        uint uv_byte_offset = uv_byte_idx % 4u;
+        atomicOr(output_data[uv_word_idx], q8_c(yuv.y) << (uv_byte_offset * 8u));
 
-        uint v_base = 2u * pixel_count;
-        uint v_byte_idx = v_base + pixel_idx;
+        uint v_byte_idx = uv_byte_idx + 1u;
         uint v_word_idx = v_byte_idx / 4u;
         uint v_byte_offset = v_byte_idx % 4u;
         atomicOr(output_data[v_word_idx], q8_c(yuv.z) << (v_byte_offset * 8u));
@@ -221,7 +221,8 @@ void main() {
         uint y_packed_idx = pixel_idx / 2u;
         atomicOr(output_data[y_packed_idx], q10_y(yuv.x) << (y_half_offset * 16u));
 
-        uint uv_base_words = pixel_count / 2u;
+        // Align UV base to 4 bytes: Y plane is ceil(pixel_count/2) words.
+        uint uv_base_words = (pixel_count + 1u) / 2u;
         uint uv_word_idx = uv_base_words + pixel_idx;
         uint uv_packed = q10_c(yuv.y) | (q10_c(yuv.z) << 16u);
         output_data[uv_word_idx] = uv_packed;
