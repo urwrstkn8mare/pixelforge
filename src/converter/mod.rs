@@ -231,6 +231,11 @@ impl ColorConverter {
         &self.context
     }
 
+    /// Get the converter configuration.
+    pub fn config(&self) -> &ColorConverterConfig {
+        &self.config
+    }
+
     /// Get the output buffer.
     ///
     /// Returns the Vulkan buffer containing raw YUV data.
