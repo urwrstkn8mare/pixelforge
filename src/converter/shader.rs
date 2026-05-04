@@ -194,10 +194,52 @@ void main() {
     if (x >= params.width || y >= params.height) return;
 
     uint pixel_idx = y * params.width + x;
+    uint pixel_count = params.width * params.height;
+
+    if (params.output_format == 3u) {
+        // P010 (10-bit NV12): fast path.
+        // - Y plane: pack two luma samples into one 32-bit word from even-x lanes
+        //   to avoid atomics.
+        // - UV plane: compute 2x2 average from even-even lanes.
+
+        if ((x & 1u) == 0u) {
+            vec3 yuv0 = rgb_to_yuv(read_rgb(ivec2(x, y)));
+            vec3 yuv1 = (x + 1u < params.width)
+                ? rgb_to_yuv(read_rgb(ivec2(x + 1u, y)))
+                : yuv0;
+
+            uint y_word_idx = pixel_idx / 2u;
+            uint y_packed = q10_y(yuv0.x) | (q10_y(yuv1.x) << 16u);
+            output_data[y_word_idx] = y_packed;
+        }
+
+        if (((x & 1u) == 0u) && ((y & 1u) == 0u)) {
+            uint uv_x = x / 2u;
+            uint uv_y = y / 2u;
+            uint uv_width = params.width / 2u;
+            uint uv_idx = uv_y * uv_width + uv_x;
+
+            vec3 yuv00 = rgb_to_yuv(read_rgb(ivec2(x, y)));
+            vec3 yuv10 = (x + 1u < params.width) ?
+                rgb_to_yuv(read_rgb(ivec2(x + 1u, y))) : yuv00;
+            vec3 yuv01 = (y + 1u < params.height) ?
+                rgb_to_yuv(read_rgb(ivec2(x, y + 1u))) : yuv00;
+            vec3 yuv11 = (x + 1u < params.width && y + 1u < params.height) ?
+                rgb_to_yuv(read_rgb(ivec2(x + 1u, y + 1u))) : yuv00;
+
+            float avg_u = (yuv00.y + yuv10.y + yuv01.y + yuv11.y) / 4.0;
+            float avg_v = (yuv00.z + yuv10.z + yuv01.z + yuv11.z) / 4.0;
+
+            uint uv_base_words = pixel_count / 2u;
+            uint uv_word_idx = uv_base_words + uv_idx;
+            uint uv_packed = q10_c(avg_u) | (q10_c(avg_v) << 16u);
+            output_data[uv_word_idx] = uv_packed;
+        }
+        return;
+    }
+
     vec3 rgb = read_rgb(ivec2(x, y));
     vec3 yuv = rgb_to_yuv(rgb);
-
-    uint pixel_count = params.width * params.height;
 
     if (params.output_format == 2u) {
         // YUV444 8-bit: 2-plane semi-planar (Y plane + UV interleaved).
@@ -228,34 +270,6 @@ void main() {
         uint uv_word_idx = uv_base_words + pixel_idx;
         uint uv_packed = q10_c(yuv.y) | (q10_c(yuv.z) << 16u);
         output_data[uv_word_idx] = uv_packed;
-    } else if (params.output_format == 3u) {
-        // P010 (10-bit NV12): 2-plane semi-planar, 4:2:0 subsampling.
-        uint y_half_offset = pixel_idx % 2u;
-        uint y_packed_idx = pixel_idx / 2u;
-        atomicOr(output_data[y_packed_idx], q10_y(yuv.x) << (y_half_offset * 16u));
-
-        if ((x % 2u == 0u) && (y % 2u == 0u)) {
-            uint uv_x = x / 2u;
-            uint uv_y = y / 2u;
-            uint uv_width = params.width / 2u;
-            uint uv_idx = uv_y * uv_width + uv_x;
-
-            vec3 yuv00 = yuv;
-            vec3 yuv10 = (x + 1u < params.width) ?
-                rgb_to_yuv(read_rgb(ivec2(x + 1u, y))) : yuv00;
-            vec3 yuv01 = (y + 1u < params.height) ?
-                rgb_to_yuv(read_rgb(ivec2(x, y + 1u))) : yuv00;
-            vec3 yuv11 = (x + 1u < params.width && y + 1u < params.height) ?
-                rgb_to_yuv(read_rgb(ivec2(x + 1u, y + 1u))) : yuv00;
-
-            float avg_u = (yuv00.y + yuv10.y + yuv01.y + yuv11.y) / 4.0;
-            float avg_v = (yuv00.z + yuv10.z + yuv01.z + yuv11.z) / 4.0;
-
-            uint uv_base_words = pixel_count / 2u;
-            uint uv_word_idx = uv_base_words + uv_idx;
-            uint uv_packed = q10_c(avg_u) | (q10_c(avg_v) << 16u);
-            output_data[uv_word_idx] = uv_packed;
-        }
     } else {
         // YUV420 8-bit (NV12 or I420): Write Y for every pixel.
         uint y_byte_idx = pixel_idx;

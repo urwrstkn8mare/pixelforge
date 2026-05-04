@@ -543,7 +543,7 @@ impl ColorConverter {
         let image_info = vk::DescriptorImageInfo::default()
             .sampler(self.sampler)
             .image_view(src_view)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            .image_layout(vk::ImageLayout::GENERAL);
 
         let write = vk::WriteDescriptorSet::default()
             .dst_set(self.descriptor_set)
@@ -566,65 +566,39 @@ impl ColorConverter {
                 .begin_command_buffer(self.command_buffer, &begin_info)
                 .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
-            // --- Phase 1: Transition source image for shader read ---
+            // --- Phase 1: Ensure source image is in GENERAL for shader read ---
+            if src_layout != vk::ImageLayout::GENERAL {
+                let src_barrier = vk::ImageMemoryBarrier::default()
+                    .old_layout(src_layout)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(src_image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ);
 
-            let src_barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(src_layout)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(src_image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
-
-            device.cmd_pipeline_barrier(
-                self.command_buffer,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[src_barrier],
-            );
+                device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[src_barrier],
+                );
+            }
 
             // --- Phase 2: Run compute shader (reads source image directly) ---
 
-            // Clear output buffer to zero before compute shader runs.
-            let output_size = self
-                .config
-                .output_format
-                .output_size(self.config.width, self.config.height);
-            device.cmd_fill_buffer(
-                self.command_buffer,
-                self.output_buffer,
-                0,
-                output_size as vk::DeviceSize,
-                0,
-            );
-
-            // Barrier: fill buffer write -> shader read/write
-            let fill_barrier = vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                .buffer(self.output_buffer)
-                .size(vk::WHOLE_SIZE);
-
-            device.cmd_pipeline_barrier(
-                self.command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[fill_barrier],
-                &[],
-            );
+            // The compute shader writes all bytes that are copied to the target image
+            // for the supported output formats, so no pre-clear is needed here.
 
             // Bind pipeline and descriptor set.
             device.cmd_bind_pipeline(
@@ -739,31 +713,14 @@ impl ColorConverter {
                     layer_count: 1,
                 });
 
-            // Transition source image back to GENERAL for reuse.
-            let src_barrier_back = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(src_image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::SHADER_READ)
-                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
-
             device.cmd_pipeline_barrier(
                 self.command_buffer,
-                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[target_barrier_to_encode, src_barrier_back],
+                &[target_barrier_to_encode],
             );
 
             device
