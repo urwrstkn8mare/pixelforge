@@ -13,7 +13,7 @@ static SPIRV_CACHE: OnceLock<Vec<u32>> = OnceLock::new();
 /// Get the SPIR-V bytecode for the color conversion shader.
 ///
 /// The shader expects:
-/// - Push constants: width, height, input_format, output_format, color_space, full_range (6 × u32)
+/// - Push constants: width, height, input_format, output_format, color_space, full_range (6 × u32) + sdr_white_nits (f32)
 /// - Binding 0: Input image (sampler2D)
 /// - Binding 1: Output buffer (YUV data)
 ///
@@ -40,9 +40,9 @@ layout(push_constant) uniform PushConstants {
     uint height;
     uint input_format;   // 0=BGRx, 1=RGBx, 2=BGRA, 3=RGBA, 4=ABGR2101010, 5=RGBA16F
     uint output_format;  // 0=NV12, 1=I420, 2=YUV444, 3=P010, 4=YUV444P10
-    uint color_space;    // 0=BT.709, 1=BT.2020, 2=sRGB→BT.2020+PQ
+    uint color_space;    // 0=BT.709, 1=BT.2020, 2=sRGB→BT.2020+PQ, 3=scRGB linear→BT.2020+PQ
     uint full_range;     // 0=limited/studio range, 1=full range
-    float sdr_white_nits; // SDR reference white (nits), used for sRGB→BT.2020+PQ
+    float sdr_white_nits; // SDR reference white (nits), used for sRGB and scRGB → BT.2020+PQ
 } params;
 
 // Source image sampled directly — eliminates the image-to-buffer copy.
@@ -124,6 +124,7 @@ vec3 bt709_to_bt2020(vec3 rgb709) {
 //
 // color_space 0 (BT.709) and 1 (BT.2020): passthrough — data is already encoded.
 // color_space 2 (sRGB→BT.2020+PQ): decode sRGB, convert gamut, apply PQ.
+// color_space 3 (scRGB→BT.2020+PQ): convert gamut, apply PQ. No EOTF — input is linear.
 vec3 read_rgb(ivec2 coord) {
     vec4 rgba = texelFetch(inputImage, coord, 0);
     if (params.color_space == 2u) {
@@ -132,6 +133,11 @@ vec3 read_rgb(ivec2 coord) {
         vec3 linear_2020 = bt709_to_bt2020(linear_709);
         // SDR reference white (configurable, default 203 nits per ITU-R BT.2408)
         // normalized to PQ's 10000 nit scale.
+        return linear_to_pq(linear_2020 * (params.sdr_white_nits / 10000.0));
+    }
+    if (params.color_space == 3u) {
+        // scRGB→BT.2020+PQ: BT.709 linear → BT.2020 gamut → PQ (no EOTF, input is already linear).
+        vec3 linear_2020 = bt709_to_bt2020(rgba.rgb);
         return linear_to_pq(linear_2020 * (params.sdr_white_nits / 10000.0));
     }
     // BT.709 or BT.2020 passthrough: values are already properly encoded.
