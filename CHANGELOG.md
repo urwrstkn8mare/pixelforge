@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+### v0.4.0 - 2026-06-05
 
 - **Removed `shaderc` dependency** — shaders are now precompiled to SPIR-V and embedded at build time via `include_bytes!`. No `glslc` or Vulkan SDK required to build the crate.
 - **Removed `build.rs`** — no longer needed since shaders are precompiled.
