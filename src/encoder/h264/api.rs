@@ -43,47 +43,10 @@ impl H264Encoder {
 
         self.upload_from_image(src_image)?;
 
-        // The DPB reference images and reference tracking (`dpb_images`,
-        // `current_dpb_slot`, `l0_references`, …) live on the encoder and are
-        // shared across pipeline slots; per-slot resources only cover the input
-        // image, command buffer, bitstream and fence. Letting two encodes run
-        // concurrently therefore races on the shared DPB: stale/half-written
-        // references show up as artifacts, and a hazard can wedge the encode so
-        // its fence never signals (the drain's `wait_for_fences(.., u64::MAX)`
-        // then hangs forever). Serialize DPB access by waiting for any other
-        // in-flight slot's encode to finish before submitting this frame. The
-        // bitstream is still drained one encode() later, so host-side readback
-        // stays pipelined.
-        self.wait_for_other_inflight_slots()?;
-
         self.encode_current_frame(&gop_position, display_order)?;
 
         self.current_slot = (self.current_slot + 1) % self.slots.len();
         Ok(prev_packet.into_iter().collect())
-    }
-
-    /// Block until every in-flight slot other than the current one has finished
-    /// encoding on the GPU. Needed because the DPB / reference state is shared
-    /// across slots, so concurrent encodes would race on it. Does not consume
-    /// the slots' bitstreams — they are still drained in order by later calls.
-    fn wait_for_other_inflight_slots(&self) -> Result<()> {
-        let current_slot = self.current_slot;
-        let pending_fences: Vec<vk::Fence> = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter(|(idx, slot)| *idx != current_slot && slot.in_flight)
-            .map(|(_, slot)| slot.encode_fence)
-            .collect();
-        if !pending_fences.is_empty() {
-            unsafe {
-                self.context
-                    .device()
-                    .wait_for_fences(&pending_fences, true, u64::MAX)
-                    .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
-            }
-        }
-        Ok(())
     }
 
     fn drain_current_slot(&mut self) -> Result<Option<EncodedPacket>> {
