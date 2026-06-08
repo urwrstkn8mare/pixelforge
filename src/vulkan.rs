@@ -2,6 +2,7 @@
 use crate::encoder::Codec;
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
+use ash::vk::TaggedStructure;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use tracing::{debug, info, warn};
@@ -471,31 +472,13 @@ impl VideoContext {
         let mut av1_encode_features =
             vk::PhysicalDeviceVideoEncodeAV1FeaturesKHR::default().video_encode_av1(true);
 
-        if supported_encode_codecs.contains(&Codec::AV1) {
-            ycbcr_2plane_444_features.p_next = (&mut av1_encode_features
-                as *mut vk::PhysicalDeviceVideoEncodeAV1FeaturesKHR)
-                .cast();
-        }
-
-        // Chain: sync2_features -> ycbcr_features -> ycbcr_2plane_444_features (-> av1 if supported)
-        ycbcr_features.p_next = (&mut ycbcr_2plane_444_features
-            as *mut vk::PhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT)
-            .cast();
-        sync2_features.p_next =
-            (&mut ycbcr_features as *mut vk::PhysicalDeviceSamplerYcbcrConversionFeatures).cast();
-
         // Query descriptor buffer and buffer device address feature support.
         let mut desc_buf_features = vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
         let mut buffer_device_address_features =
             vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
 
         if has_descriptor_buffer_ext {
-            let mut feat2 = vk::PhysicalDeviceFeatures2 {
-                p_next: (&mut desc_buf_features
-                    as *mut vk::PhysicalDeviceDescriptorBufferFeaturesEXT)
-                    .cast(),
-                ..Default::default()
-            };
+            let mut feat2 = vk::PhysicalDeviceFeatures2::default().push(&mut desc_buf_features);
             unsafe {
                 instance.get_physical_device_features2(physical_device, &mut feat2);
             }
@@ -503,12 +486,8 @@ impl VideoContext {
                 && desc_buf_features.descriptor_buffer_capture_replay != 0;
 
             // Query buffer device address support.
-            let mut feat2_bda = vk::PhysicalDeviceFeatures2 {
-                p_next: (&mut buffer_device_address_features
-                    as *mut vk::PhysicalDeviceBufferDeviceAddressFeatures)
-                    .cast(),
-                ..Default::default()
-            };
+            let mut feat2_bda =
+                vk::PhysicalDeviceFeatures2::default().push(&mut buffer_device_address_features);
             unsafe {
                 instance.get_physical_device_features2(physical_device, &mut feat2_bda);
             }
@@ -519,16 +498,6 @@ impl VideoContext {
             } else if desc_buf_supported {
                 warn!("VK_EXT_descriptor_buffer extension present but bufferDeviceAddress not supported; descriptor buffer will not be enabled");
             }
-        }
-
-        // Build the feature chain: desc_buf_features -> buffer_device_address_features -> sync2_features -> ...
-        // Only chain desc_buf_features if the extension was available.
-        if has_descriptor_buffer_ext {
-            buffer_device_address_features.p_next =
-                (&mut sync2_features as *mut vk::PhysicalDeviceSynchronization2Features).cast();
-            desc_buf_features.p_next = (&mut buffer_device_address_features
-                as *mut vk::PhysicalDeviceBufferDeviceAddressFeatures)
-                .cast();
         }
 
         // Store whether descriptor buffer is available for use by callers.
@@ -545,17 +514,22 @@ impl VideoContext {
 
         let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
-            .enabled_extension_names(&extension_names);
+            .enabled_extension_names(&extension_names)
+            .push(&mut sync2_features);
 
         // Attach the chain to device_create_info.
         // When descriptor buffer is available, the chain is:
         //   desc_buf_features -> buffer_device_address_features -> sync2_features -> ...
         // When descriptor buffer is not available, only sync2_features is chained.
-        device_create_info.p_next = if has_descriptor_buffer_ext {
-            (&mut desc_buf_features as *mut vk::PhysicalDeviceDescriptorBufferFeaturesEXT).cast()
-        } else {
-            (&mut sync2_features as *mut vk::PhysicalDeviceSynchronization2Features).cast()
-        };
+        if has_descriptor_buffer_ext {
+            device_create_info = device_create_info.push(&mut desc_buf_features);
+            if supported_encode_codecs.contains(&Codec::AV1) {
+                device_create_info = device_create_info.push(&mut av1_encode_features);
+            }
+            device_create_info = device_create_info
+                .push(&mut ycbcr_features)
+                .push(&mut ycbcr_2plane_444_features);
+        }
 
         let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }
             .map_err(|e| PixelForgeError::DeviceCreation(e.to_string()))?;
@@ -608,25 +582,19 @@ impl VideoContext {
         );
 
         // Create video profile info for H.264 encode with typical 8-bit 4:2:0.
-        let mut profile_info = vk::VideoProfileInfoKHR::default()
+        let profile_info = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
             .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
             .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
-
-        // Chain the codec-specific profile into profile_info.
-        profile_info.p_next = (&mut h264_profile as *mut vk::VideoEncodeH264ProfileInfoKHR).cast();
+            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+            .push(&mut h264_profile);
 
         // Create capabilities structures.
         let mut h264_capabilities = vk::VideoEncodeH264CapabilitiesKHR::default();
-        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR {
-            p_next: &mut h264_capabilities as *mut vk::VideoEncodeH264CapabilitiesKHR as *mut _,
-            ..Default::default()
-        };
-        let mut capabilities = vk::VideoCapabilitiesKHR {
-            p_next: &mut encode_capabilities as *mut vk::VideoEncodeCapabilitiesKHR as *mut _,
-            ..Default::default()
-        };
+        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR::default();
+        let mut capabilities = vk::VideoCapabilitiesKHR::default()
+            .push(&mut h264_capabilities)
+            .push(&mut encode_capabilities);
 
         // Query capabilities.
         let result = unsafe {
@@ -673,25 +641,19 @@ impl VideoContext {
         );
 
         // Create video profile info for H.265 encode with typical 8-bit 4:2:0.
-        let mut profile_info = vk::VideoProfileInfoKHR::default()
+        let profile_info = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
             .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
             .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
-
-        // Chain the codec-specific profile into profile_info.
-        profile_info.p_next = (&mut h265_profile as *mut vk::VideoEncodeH265ProfileInfoKHR).cast();
+            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+            .push(&mut h265_profile);
 
         // Create capabilities structures.
         let mut h265_capabilities = vk::VideoEncodeH265CapabilitiesKHR::default();
-        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR {
-            p_next: &mut h265_capabilities as *mut vk::VideoEncodeH265CapabilitiesKHR as *mut _,
-            ..Default::default()
-        };
-        let mut capabilities = vk::VideoCapabilitiesKHR {
-            p_next: &mut encode_capabilities as *mut vk::VideoEncodeCapabilitiesKHR as *mut _,
-            ..Default::default()
-        };
+        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR::default();
+        let mut capabilities = vk::VideoCapabilitiesKHR::default()
+            .push(&mut h265_capabilities)
+            .push(&mut encode_capabilities);
 
         // Query capabilities.
         let result = unsafe {
@@ -737,25 +699,19 @@ impl VideoContext {
             .std_profile(ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN);
 
         // Create video profile info for AV1 encode with typical 8-bit 4:2:0.
-        let mut profile_info = vk::VideoProfileInfoKHR::default()
+        let profile_info = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
             .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
             .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8);
-
-        // Chain the codec-specific profile into profile_info.
-        profile_info.p_next = (&mut av1_profile as *mut vk::VideoEncodeAV1ProfileInfoKHR).cast();
+            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+            .push(&mut av1_profile);
 
         // Create capabilities structures.
         let mut av1_capabilities = vk::VideoEncodeAV1CapabilitiesKHR::default();
-        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR {
-            p_next: &mut av1_capabilities as *mut vk::VideoEncodeAV1CapabilitiesKHR as *mut _,
-            ..Default::default()
-        };
-        let mut capabilities = vk::VideoCapabilitiesKHR {
-            p_next: &mut encode_capabilities as *mut vk::VideoEncodeCapabilitiesKHR as *mut _,
-            ..Default::default()
-        };
+        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR::default();
+        let mut capabilities = vk::VideoCapabilitiesKHR::default()
+            .push(&mut av1_capabilities)
+            .push(&mut encode_capabilities);
 
         // Query capabilities.
         let result = unsafe {

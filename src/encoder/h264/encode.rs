@@ -7,6 +7,7 @@ use crate::encoder::resources::{
 };
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
+use ash::vk::TaggedStructure;
 use tracing::debug;
 
 impl H264Encoder {
@@ -330,11 +331,12 @@ impl H264Encoder {
             .enumerate()
         {
             let ref_info = &self.l0_references[i];
-            let mut slot = vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(ref_info.dpb_slot as i32)
-                .picture_resource(resource);
-            slot.p_next = (dpb_info as *mut vk::VideoEncodeH264DpbSlotInfoKHR).cast();
-            l0_slots.push(slot);
+            l0_slots.push(
+                vk::VideoReferenceSlotInfoKHR::default()
+                    .slot_index(ref_info.dpb_slot as i32)
+                    .picture_resource(resource)
+                    .push(dpb_info),
+            );
         }
 
         // 4. Handle Backward Ref (L1) for B-frames
@@ -371,11 +373,12 @@ impl H264Encoder {
         };
 
         let backward_ref_slot = if let Some(ref resource) = backward_resource {
-            let mut slot = vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(self.backward_reference_dpb_slot as i32)
-                .picture_resource(resource);
-            slot.p_next = (&mut backward_dpb_info as *mut vk::VideoEncodeH264DpbSlotInfoKHR).cast();
-            Some(slot)
+            Some(
+                vk::VideoReferenceSlotInfoKHR::default()
+                    .slot_index(self.backward_reference_dpb_slot as i32)
+                    .picture_resource(resource)
+                    .push(&mut backward_dpb_info),
+            )
         } else {
             None
         };
@@ -399,21 +402,19 @@ impl H264Encoder {
         let mut h264_dpb_slot_info =
             vk::VideoEncodeH264DpbSlotInfoKHR::default().std_reference_info(&std_reference_info);
 
-        let mut setup_reference_slot = vk::VideoReferenceSlotInfoKHR::default()
+        let setup_reference_slot = vk::VideoReferenceSlotInfoKHR::default()
             .slot_index(self.current_dpb_slot as i32)
-            .picture_resource(&setup_picture_resource);
-        setup_reference_slot.p_next =
-            (&mut h264_dpb_slot_info as *mut vk::VideoEncodeH264DpbSlotInfoKHR).cast();
+            .picture_resource(&setup_picture_resource)
+            .push(&mut h264_dpb_slot_info);
 
         // Also create a setup slot for begin_info (slotIndex = -1)
         let mut h264_begin_dpb_slot_info =
             vk::VideoEncodeH264DpbSlotInfoKHR::default().std_reference_info(&std_reference_info);
 
-        let mut setup_slot_for_begin = vk::VideoReferenceSlotInfoKHR::default()
+        let setup_slot_for_begin = vk::VideoReferenceSlotInfoKHR::default()
             .slot_index(-1) // Marked as inactive for begin
-            .picture_resource(&setup_picture_resource);
-        setup_slot_for_begin.p_next =
-            (&mut h264_begin_dpb_slot_info as *mut vk::VideoEncodeH264DpbSlotInfoKHR).cast();
+            .picture_resource(&setup_picture_resource)
+            .push(&mut h264_begin_dpb_slot_info);
 
         // Collect final reference slots for VIDEO ENCODE INFO
         let mut encode_ref_slots = Vec::new();
@@ -441,8 +442,7 @@ impl H264Encoder {
             encode_info = encode_info.reference_slots(&encode_ref_slots);
         }
 
-        encode_info.p_next =
-            (&mut h264_picture_info as *mut vk::VideoEncodeH264PictureInfoKHR).cast();
+        encode_info = encode_info.push(&mut h264_picture_info);
 
         // Collect reference slots for BEGIN VIDEO CODING
         let mut reference_slots_for_begin = vec![setup_slot_for_begin];
@@ -492,13 +492,12 @@ impl H264Encoder {
             .use_max_qp(true)
             .max_qp(max_qp);
 
-        let mut rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
+        let rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
             .average_bitrate(average_bitrate as u64)
             .max_bitrate(max_bitrate as u64)
             .frame_rate_numerator(self.config.frame_rate_numerator)
-            .frame_rate_denominator(self.config.frame_rate_denominator);
-        rc_layer_info.p_next =
-            (&mut h264_rc_layer_info as *mut vk::VideoEncodeH264RateControlLayerInfoKHR).cast();
+            .frame_rate_denominator(self.config.frame_rate_denominator)
+            .push(&mut h264_rc_layer_info);
 
         let rc_layers = [rc_layer_info];
 
@@ -514,7 +513,6 @@ impl H264Encoder {
                 .layers(&rc_layers)
                 .virtual_buffer_size_in_ms(self.config.virtual_buffer_size_ms)
                 .initial_virtual_buffer_size_in_ms(self.config.initial_virtual_buffer_size_ms);
-            rc_info.p_next = &mut h264_rc_info as *mut _ as *mut std::ffi::c_void;
         }
 
         // Begin video coding.
@@ -526,13 +524,14 @@ impl H264Encoder {
                 .video_session(self.session)
                 .video_session_parameters(self.session_params)
                 .reference_slots(&reference_slots_for_begin)
+                .push(&mut h264_rc_info)
         } else {
-            let mut info = vk::VideoBeginCodingInfoKHR::default()
+            vk::VideoBeginCodingInfoKHR::default()
                 .video_session(self.session)
                 .video_session_parameters(self.session_params)
-                .reference_slots(&reference_slots_for_begin);
-            info.p_next = (&mut rc_info as *mut vk::VideoEncodeRateControlInfoKHR).cast();
-            info
+                .reference_slots(&reference_slots_for_begin)
+                .push(&mut h264_rc_info)
+                .push(&mut rc_info)
         };
 
         unsafe {
@@ -548,16 +547,15 @@ impl H264Encoder {
         if is_first_frame {
             let mut quality_level_info =
                 vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
-            quality_level_info.p_next =
-                (&mut rc_info as *mut vk::VideoEncodeRateControlInfoKHR).cast();
 
-            let mut control_info = vk::VideoCodingControlInfoKHR::default().flags(
-                vk::VideoCodingControlFlagsKHR::RESET
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-            );
-            control_info.p_next =
-                (&mut quality_level_info as *mut vk::VideoEncodeQualityLevelInfoKHR).cast();
+            let control_info = vk::VideoCodingControlInfoKHR::default()
+                .flags(
+                    vk::VideoCodingControlFlagsKHR::RESET
+                        | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
+                )
+                .push(&mut rc_info)
+                .push(&mut quality_level_info);
 
             unsafe {
                 (self.video_queue_fn.fp().cmd_control_video_coding_khr)(

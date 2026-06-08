@@ -2,6 +2,7 @@ use crate::encoder::{BitDepth, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
+use ash::vk::TaggedStructure;
 use std::ptr;
 
 /// Minimum bitstream buffer size.
@@ -46,8 +47,9 @@ pub(crate) fn query_supported_video_formats(
     let profiles = [*profile_info];
     let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
 
-    let mut format_info = vk::PhysicalDeviceVideoFormatInfoKHR::default().image_usage(image_usage);
-    format_info.p_next = (&mut profile_list as *mut vk::VideoProfileListInfoKHR).cast();
+    let format_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
+        .image_usage(image_usage)
+        .push(&mut profile_list);
 
     let physical_device = context.physical_device();
     let mut count = 0u32;
@@ -170,10 +172,10 @@ pub(crate) fn create_buffer_with_device_address(
 
     let mut alloc_flags_info =
         vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-    let mut alloc_info = vk::MemoryAllocateInfo::default()
+    let alloc_info = vk::MemoryAllocateInfo::default()
         .allocation_size(mem_requirements.size)
-        .memory_type_index(memory_type_index);
-    alloc_info.p_next = &mut alloc_flags_info as *mut _ as *mut _;
+        .memory_type_index(memory_type_index)
+        .push(&mut alloc_flags_info);
 
     let memory = match unsafe { device.allocate_memory(&alloc_info, None) } {
         Ok(m) => m,
@@ -216,11 +218,11 @@ pub(crate) fn create_bitstream_buffer(
     let profiles = [*profile_info];
     let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
 
-    let mut create_info = vk::BufferCreateInfo::default()
+    let create_info = vk::BufferCreateInfo::default()
         .size(size as vk::DeviceSize)
         .usage(vk::BufferUsageFlags::VIDEO_ENCODE_DST_KHR)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    create_info.p_next = (&mut profile_list as *mut vk::VideoProfileListInfoKHR).cast();
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .push(&mut profile_list);
 
     let buffer = unsafe { context.device().create_buffer(&create_info, None) }
         .map_err(|e| PixelForgeError::ResourceCreation(format!("buffer creation: {}", e)))?;
@@ -306,7 +308,7 @@ pub(crate) fn create_image(
     let profiles = [*profile_info];
     let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
 
-    let mut create_info = vk::ImageCreateInfo::default()
+    let create_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
         .extent(vk::Extent3D {
@@ -321,8 +323,8 @@ pub(crate) fn create_image(
         .usage(usage)
         .sharing_mode(sharing_mode)
         .queue_family_indices(&queue_families)
-        .initial_layout(vk::ImageLayout::UNDEFINED);
-    create_info.p_next = (&mut profile_list as *mut vk::VideoProfileListInfoKHR).cast();
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .push(&mut profile_list);
 
     let image = unsafe { context.device().create_image(&create_info, None) }
         .map_err(|e| PixelForgeError::ResourceCreation(format!("image creation: {}", e)))?;
@@ -591,7 +593,7 @@ pub(crate) fn create_dpb_images(
         let profiles = [*profile_info];
         let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
 
-        let mut create_info = vk::ImageCreateInfo::default()
+        let create_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(vk::Extent3D {
@@ -605,8 +607,8 @@ pub(crate) fn create_dpb_images(
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
-        create_info.p_next = (&mut profile_list as *mut vk::VideoProfileListInfoKHR).cast();
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push(&mut profile_list);
 
         let image = unsafe { context.device().create_image(&create_info, None) }
             .map_err(|e| PixelForgeError::ResourceCreation(format!("layered DPB image: {}", e)))?;

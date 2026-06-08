@@ -8,6 +8,7 @@ use crate::encoder::resources::find_memory_type;
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
+use ash::vk::TaggedStructure;
 
 /// Precompiled SPIR-V bytecode for the color conversion compute shader.
 const COLOR_CONVERT_SPIRV_BYTES: &[u8] = include_bytes!("../../shader/color_convert.spv");
@@ -153,10 +154,7 @@ pub fn create_converter(
     // runtime descriptor population. The correct sizes for in-buffer
     // descriptors are the regular `*_descriptor_size` fields.
     let mut db_props = vk::PhysicalDeviceDescriptorBufferPropertiesEXT::default();
-    let mut props = vk::PhysicalDeviceProperties2 {
-        p_next: &mut db_props as *mut _ as *mut _,
-        ..Default::default()
-    };
+    let mut props = vk::PhysicalDeviceProperties2::default().push(&mut db_props);
     unsafe {
         instance.get_physical_device_properties2(physical_device, &mut props);
     }

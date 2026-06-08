@@ -6,6 +6,7 @@ use crate::encoder::{ColorDescription, EncodedPacket};
 use crate::error::Result;
 use crate::PixelForgeError;
 use ash::vk;
+use ash::vk::TaggedStructure;
 use tracing::debug;
 
 impl H265Encoder {
@@ -212,24 +213,17 @@ impl H265Encoder {
             .std_sps_id(0)
             .std_pps_id(0);
 
-        let get_info = vk::VideoEncodeSessionParametersGetInfoKHR {
-            video_session_parameters: self.session_params,
-            p_next: (&mut h265_get_info as *mut vk::VideoEncodeH265SessionParametersGetInfoKHR)
-                .cast(),
-            ..Default::default()
-        };
+        let get_info = vk::VideoEncodeSessionParametersGetInfoKHR::default()
+            .video_session_parameters(self.session_params)
+            .push(&mut h265_get_info);
 
         // Some implementations misbehave for a size-only query (pData = NULL). Use a
         // preallocated buffer and retry on INCOMPLETE (vk_video_samples-style).
         let mut data = vec![0u8; 4096];
         let mut data_size: usize = data.len();
         let mut h265_feedback = vk::VideoEncodeH265SessionParametersFeedbackInfoKHR::default();
-        let mut feedback = vk::VideoEncodeSessionParametersFeedbackInfoKHR {
-            p_next: (&mut h265_feedback
-                as *mut vk::VideoEncodeH265SessionParametersFeedbackInfoKHR)
-                .cast(),
-            ..Default::default()
-        };
+        let mut feedback =
+            vk::VideoEncodeSessionParametersFeedbackInfoKHR::default().push(&mut h265_feedback);
 
         let mut attempts = 0;
         loop {

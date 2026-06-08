@@ -12,6 +12,7 @@ use crate::encoder::{BitDepth, ColorDescription, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
+use ash::vk::TaggedStructure;
 use std::ptr;
 use tracing::{debug, info};
 
@@ -78,26 +79,21 @@ impl H265Encoder {
         let mut h265_profile_info =
             vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc);
 
-        let mut profile_info = vk::VideoProfileInfoKHR::default()
+        let profile_info = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
             .chroma_subsampling(chroma_subsampling)
             .luma_bit_depth(bit_depth_flags)
-            .chroma_bit_depth(bit_depth_flags);
-        profile_info.p_next =
-            (&mut h265_profile_info as *mut vk::VideoEncodeH265ProfileInfoKHR).cast();
+            .chroma_bit_depth(bit_depth_flags)
+            .push(&mut h265_profile_info);
 
         // Query capabilities to determine limits.
         let video_queue_instance =
             ash::khr::video_queue::Instance::load(context.entry(), context.instance());
         let mut h265_capabilities = vk::VideoEncodeH265CapabilitiesKHR::default();
-        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR {
-            p_next: (&mut h265_capabilities as *mut vk::VideoEncodeH265CapabilitiesKHR).cast(),
-            ..Default::default()
-        };
-        let mut capabilities = vk::VideoCapabilitiesKHR {
-            p_next: (&mut encode_capabilities as *mut vk::VideoEncodeCapabilitiesKHR).cast(),
-            ..Default::default()
-        };
+        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR::default();
+        let mut capabilities = vk::VideoCapabilitiesKHR::default()
+            .push(&mut h265_capabilities)
+            .push(&mut encode_capabilities);
 
         let result = unsafe {
             (video_queue_instance
@@ -305,13 +301,12 @@ impl H265Encoder {
         // Create profile info for images/buffers
         let mut h265_profile_for_resources =
             vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc);
-        let mut profile_for_resources = vk::VideoProfileInfoKHR::default()
+        let profile_for_resources = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
             .chroma_subsampling(chroma_subsampling)
             .luma_bit_depth(bit_depth_flags)
-            .chroma_bit_depth(bit_depth_flags);
-        profile_for_resources.p_next =
-            (&mut h265_profile_for_resources as *mut vk::VideoEncodeH265ProfileInfoKHR).cast();
+            .chroma_bit_depth(bit_depth_flags)
+            .push(&mut h265_profile_for_resources);
 
         // Create input image
         let (input_image, input_image_memory, input_image_view) = create_image(
@@ -389,9 +384,8 @@ impl H265Encoder {
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
             .chroma_subsampling(chroma_subsampling)
             .luma_bit_depth(bit_depth_flags)
-            .chroma_bit_depth(bit_depth_flags);
-        profile_info_query.p_next =
-            (&mut h265_profile_info_query as *mut vk::VideoEncodeH265ProfileInfoKHR).cast();
+            .chroma_bit_depth(bit_depth_flags)
+            .push(&mut h265_profile_info_query);
 
         let mut encode_feedback_create = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default()
             .encode_feedback_flags(
@@ -399,15 +393,13 @@ impl H265Encoder {
                     | vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
             );
 
-        encode_feedback_create.p_next =
-            (&mut profile_info_query as *mut vk::VideoProfileInfoKHR).cast();
-
-        let mut query_pool_create_info = vk::QueryPoolCreateInfo::default()
-            .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
-            .query_count(1);
-        query_pool_create_info.p_next = (&mut encode_feedback_create
-            as *mut vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR)
-            .cast();
+        let query_pool_create_info = unsafe {
+            vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
+                .query_count(1)
+                .extend(&mut profile_info_query)
+                .push(&mut encode_feedback_create)
+        };
 
         let query_pool = unsafe {
             context

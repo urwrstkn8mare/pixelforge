@@ -7,6 +7,7 @@ use crate::encoder::resources::{
 };
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
+use ash::vk::TaggedStructure;
 use tracing::debug;
 
 impl AV1Encoder {
@@ -128,16 +129,14 @@ impl AV1Encoder {
         };
 
         // AV1 DPB slot info for the setup reference slot (the slot being written).
-        let setup_av1_dpb_info =
+        let mut setup_av1_dpb_info =
             vk::VideoEncodeAV1DpbSlotInfoKHR::default().std_reference_info(&std_reference_info);
 
-        let mut setup_reference_slot = vk::VideoReferenceSlotInfoKHR::default()
+        let mut setup_av1_dpb_info_ref0 = setup_av1_dpb_info.clone();
+        let setup_reference_slot = vk::VideoReferenceSlotInfoKHR::default()
             .slot_index(self.current_dpb_slot as i32)
-            .picture_resource(&setup_picture_resource);
-
-        // Attach AV1 DPB info to setup slot's pNext chain.
-        setup_reference_slot.p_next =
-            (&setup_av1_dpb_info as *const vk::VideoEncodeAV1DpbSlotInfoKHR).cast();
+            .picture_resource(&setup_picture_resource)
+            .push(&mut setup_av1_dpb_info_ref0);
 
         // Reference frames for inter frames.
         let mut reference_slots = Vec::new();
@@ -179,8 +178,7 @@ impl AV1Encoder {
                 .picture_resource(&ref_picture_resources[0]);
             reference_slots.push(ref_slot);
             // Now set pNext after it's in the vector at its final location.
-            reference_slots[0].p_next =
-                (&av1_reference_infos[0] as *const vk::VideoEncodeAV1DpbSlotInfoKHR).cast();
+            reference_slots[0] = reference_slots[0].push(&mut av1_reference_infos[0]);
         }
 
         // AV1 quantization parameters - required structure.
@@ -347,21 +345,14 @@ impl AV1Encoder {
             .use_max_q_index(true)
             .max_q_index(max_q_index);
 
-        let mut rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
+        let rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
             .average_bitrate(average_bitrate as u64)
             .max_bitrate(max_bitrate as u64)
             .frame_rate_numerator(self.config.frame_rate_numerator)
-            .frame_rate_denominator(self.config.frame_rate_denominator);
-        rc_layer_info.p_next =
-            (&mut av1_rc_layer_info as *mut vk::VideoEncodeAV1RateControlLayerInfoKHR).cast();
-        let rc_layers = [rc_layer_info];
+            .frame_rate_denominator(self.config.frame_rate_denominator)
+            .push(&mut av1_rc_layer_info);
 
-        // AV1-specific rate control info.
-        let mut av1_rc_info = vk::VideoEncodeAV1RateControlInfoKHR::default()
-            .gop_frame_count(self.config.gop_size)
-            .key_frame_period(self.config.gop_size)
-            .consecutive_bipredictive_frame_count(0)
-            .temporal_layer_count(1);
+        let rc_layers = [rc_layer_info];
 
         // Rate control info (matches H265 pattern: only add layers/buffer for non-DISABLED modes).
         let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default().rate_control_mode(rc_mode);
@@ -371,7 +362,6 @@ impl AV1Encoder {
                 .layers(&rc_layers)
                 .virtual_buffer_size_in_ms(self.config.virtual_buffer_size_ms)
                 .initial_virtual_buffer_size_in_ms(self.config.initial_virtual_buffer_size_ms);
-            rc_info.p_next = (&mut av1_rc_info as *mut vk::VideoEncodeAV1RateControlInfoKHR).cast();
         }
 
         // Video begin coding info.
@@ -382,11 +372,10 @@ impl AV1Encoder {
         if is_reference {
             // Build a separate setup slot for begin coding with slot_index = -1.
             // This tells the implementation the slot is being set up, not yet active.
-            let mut setup_slot_for_begin = vk::VideoReferenceSlotInfoKHR::default()
+            let setup_slot_for_begin = vk::VideoReferenceSlotInfoKHR::default()
                 .slot_index(-1)
-                .picture_resource(&setup_picture_resource);
-            setup_slot_for_begin.p_next =
-                (&setup_av1_dpb_info as *const vk::VideoEncodeAV1DpbSlotInfoKHR).cast();
+                .picture_resource(&setup_picture_resource)
+                .push(&mut setup_av1_dpb_info);
             all_reference_slots.push(setup_slot_for_begin);
         }
 
@@ -409,12 +398,11 @@ impl AV1Encoder {
                 .video_session_parameters(self.session_params)
                 .reference_slots(&all_reference_slots)
         } else {
-            let mut info = vk::VideoBeginCodingInfoKHR::default()
+            vk::VideoBeginCodingInfoKHR::default()
                 .video_session(self.session)
                 .video_session_parameters(self.session_params)
-                .reference_slots(&all_reference_slots);
-            info.p_next = (&rc_info as *const vk::VideoEncodeRateControlInfoKHR).cast();
-            info
+                .reference_slots(&all_reference_slots)
+                .push(&mut rc_info)
         };
 
         unsafe {
@@ -426,18 +414,24 @@ impl AV1Encoder {
         // Combine RESET + RATE_CONTROL + QUALITY_LEVEL into a single control command.
         // This matches the H265 approach and is required for AMD RADV.
         if is_first_frame {
+            // AV1-specific rate control info.
+            let mut av1_rc_info = vk::VideoEncodeAV1RateControlInfoKHR::default()
+                .gop_frame_count(self.config.gop_size)
+                .key_frame_period(self.config.gop_size)
+                .consecutive_bipredictive_frame_count(0)
+                .temporal_layer_count(1);
+
             let mut quality_level_info =
                 vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
-            quality_level_info.p_next =
-                (&rc_info as *const vk::VideoEncodeRateControlInfoKHR).cast();
 
-            let mut control_info = vk::VideoCodingControlInfoKHR::default().flags(
-                vk::VideoCodingControlFlagsKHR::RESET
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-            );
-            control_info.p_next =
-                (&quality_level_info as *const vk::VideoEncodeQualityLevelInfoKHR).cast();
+            let control_info = vk::VideoCodingControlInfoKHR::default()
+                .flags(
+                    vk::VideoCodingControlFlagsKHR::RESET
+                        | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
+                )
+                .push(&mut av1_rc_info)
+                .push(&mut quality_level_info);
 
             unsafe {
                 self.video_queue_fn
@@ -466,7 +460,7 @@ impl AV1Encoder {
             encode_info = encode_info.reference_slots(&reference_slots);
         }
 
-        encode_info.p_next = (&av1_picture_info as *const vk::VideoEncodeAV1PictureInfoKHR).cast();
+        encode_info = encode_info.push(&mut av1_picture_info);
 
         // Begin query to capture encode feedback (bitstream size, status).
         unsafe {
