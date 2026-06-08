@@ -146,6 +146,11 @@
 //! # }
 //! ```
 //!
+//! # Shader Development
+//!
+//! The color conversion shader is precompiled to SPIR-V and embedded at build time.
+//! See [shader/README.md](shader/README.md) for details on editing and recompiling shaders.
+//!
 //! # Examples
 //!
 //! Run the examples with:
