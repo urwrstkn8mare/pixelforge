@@ -555,6 +555,7 @@ impl H264Encoder {
                         | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
                 )
                 .push(&mut rc_info)
+                .push(&mut h264_rc_info)
                 .push(&mut quality_level_info);
 
             unsafe {

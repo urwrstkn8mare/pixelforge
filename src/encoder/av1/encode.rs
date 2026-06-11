@@ -432,6 +432,7 @@ impl AV1Encoder {
                         | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
                         | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
                 )
+                .push(&mut rc_info)
                 .push(&mut av1_rc_info)
                 .push(&mut quality_level_info);
 

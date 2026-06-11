@@ -583,6 +583,7 @@ impl H265Encoder {
                         | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
                 )
                 .push(&mut rc_info)
+                .push(&mut h265_rc_info)
                 .push(&mut quality_level_info);
 
             unsafe {
