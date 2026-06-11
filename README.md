@@ -6,6 +6,15 @@
 
 A Vulkan-based video encoding library for Rust, supporting H.264, H.265, and AV1 codecs.
 
+> **Note — this is the `dev` branch of a fork.** It tracks upstream [`hgaiser/pixelforge`](https://github.com/hgaiser/pixelforge) `main` (v0.5.0) and bundles the following PRs on top:
+>
+> | PR | Change |
+> |----|--------|
+> | [#12](https://github.com/hgaiser/pixelforge/pull/12) | Depth-2 encoder pipelining to reduce encode latency. |
+> | [porkloin#1](https://github.com/porkloin/pixelforge/pull/1) | Fixes for #12: serialize DPB access across pipelined encode slots, and chain encode submissions with timeline semaphores instead of host-side waits. |
+>
+> [#15](https://github.com/hgaiser/pixelforge/pull/15) (`Bt709LinearToBt2020Pq` scRGB→HDR color space), previously bundled here, is now merged upstream.
+
 ## Features
 
 - **Hardware-accelerated** video encoding using Vulkan Video extensions.
