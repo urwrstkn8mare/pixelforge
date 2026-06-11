@@ -466,7 +466,7 @@ impl Encoder {
     /// # let yuv_data = vec![0u8; 1920 * 1080 * 3 / 2];
     /// input.upload_yuv420(&yuv_data)?;
     ///
-    /// // Encode the image
+    /// // Encode the image (no GPU wait semaphore needed when uploaded synchronously).
     /// let packets = encoder.encode(input.image())?;
     /// # Ok(())
     /// # }
