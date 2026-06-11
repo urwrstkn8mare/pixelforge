@@ -20,12 +20,7 @@
 //! |-------|--------|
 //! | H.264/AVC | ✓ |
 //! | H.265/HEVC | ✓ |
-//! | AV1 | ✓ (experimental) |
-//!
-//! > ⚠️ **AV1 Warning**: AV1 encoding is experimental. On NVIDIA GPUs, P-frames cannot
-//! > reference other P-frames, causing all P-frames to reference the I-frame instead. This
-//! > leads to progressively larger frame sizes over time. Consider using H.264 or HEVC
-//! > until this is resolved.
+//! | AV1 | ✓ |
 //!
 //! # Requirements
 //!

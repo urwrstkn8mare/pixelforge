@@ -24,9 +24,9 @@ A Vulkan-based video encoding library for Rust, supporting H.264, H.265, and AV1
 
 | Codec | Encode |
 |-------|--------|
-| H.264/AVC  | ✓ |
+| H.264/AVC | ✓ |
 | H.265/HEVC | ✓ |
-| AV1        | ✓ |
+| AV1 | ✓ |
 
 ## Requirements
 
