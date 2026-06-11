@@ -4,6 +4,7 @@
 //! from the Vulkan video extensions.
 
 use ash::vk;
+use ash::vk::TaggedStructure;
 use pixelforge::{Codec, VideoContextBuilder};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
@@ -37,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Codec Support:");
     println!("--------------");
 
-    let codecs = [Codec::H264, Codec::H265];
+    let codecs = [Codec::H264, Codec::H265, Codec::AV1];
 
     for codec in codecs {
         println!("\n{:?}:", codec);
@@ -95,7 +96,7 @@ fn query_detailed_capabilities(
         println!("    Checking {}: ", desc);
 
         // Construct profile info
-        let (mut profile_info, mut h264_profile, mut h265_profile) = match codec {
+        let (mut profile_info, mut h264_profile, mut h265_profile, mut av1_profile) = match codec {
             Codec::H264 => {
                 let profile_idc = if subsampling == vk::VideoChromaSubsamplingFlagsKHR::TYPE_444 {
                     ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_HIGH_444_PREDICTIVE
@@ -110,7 +111,7 @@ fn query_detailed_capabilities(
                     .chroma_subsampling(subsampling)
                     .luma_bit_depth(bit_depth)
                     .chroma_bit_depth(bit_depth);
-                (info, Some(h264), None)
+                (info, Some(h264), None, None)
             }
             Codec::H265 => {
                 let profile_idc = if subsampling == vk::VideoChromaSubsamplingFlagsKHR::TYPE_444 {
@@ -128,30 +129,46 @@ fn query_detailed_capabilities(
                     .chroma_subsampling(subsampling)
                     .luma_bit_depth(bit_depth)
                     .chroma_bit_depth(bit_depth);
-                (info, None, Some(h265))
+                (info, None, Some(h265), None)
             }
-            _ => return Ok(()),
+            Codec::AV1 => {
+                let profile = if subsampling == vk::VideoChromaSubsamplingFlagsKHR::TYPE_444 {
+                    ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_HIGH
+                } else {
+                    ash::vk::native::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN
+                };
+
+                let av1 = vk::VideoEncodeAV1ProfileInfoKHR::default().std_profile(profile);
+                let info = vk::VideoProfileInfoKHR::default()
+                    .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
+                    .chroma_subsampling(subsampling)
+                    .luma_bit_depth(bit_depth)
+                    .chroma_bit_depth(bit_depth);
+                (info, None, None, Some(av1))
+            }
         };
 
         if let Some(h264) = &mut h264_profile {
-            profile_info.p_next = (h264 as *mut vk::VideoEncodeH264ProfileInfoKHR).cast();
+            profile_info = profile_info.push(h264);
         }
         if let Some(h265) = &mut h265_profile {
-            profile_info.p_next = (h265 as *mut vk::VideoEncodeH265ProfileInfoKHR).cast();
+            profile_info = profile_info.push(h265);
+        }
+        if let Some(av1) = &mut av1_profile {
+            profile_info = profile_info.push(av1);
         }
 
         // 1. Query Video Capabilities
-        let mut caps = vk::VideoCapabilitiesKHR::default();
         let mut encode_caps = vk::VideoEncodeCapabilitiesKHR::default();
-        caps.p_next = (&mut encode_caps as *mut vk::VideoEncodeCapabilitiesKHR).cast();
+        let mut caps = vk::VideoCapabilitiesKHR::default().push(&mut encode_caps);
 
         let mut h264_caps = vk::VideoEncodeH264CapabilitiesKHR::default();
         let mut h265_caps = vk::VideoEncodeH265CapabilitiesKHR::default();
-
-        if codec == Codec::H264 {
-            encode_caps.p_next = (&mut h264_caps as *mut vk::VideoEncodeH264CapabilitiesKHR).cast();
-        } else if codec == Codec::H265 {
-            encode_caps.p_next = (&mut h265_caps as *mut vk::VideoEncodeH265CapabilitiesKHR).cast();
+        let mut av1_caps = vk::VideoEncodeAV1CapabilitiesKHR::default();
+        match codec {
+            Codec::H264 => caps = caps.push(&mut h264_caps),
+            Codec::H265 => caps = caps.push(&mut h265_caps),
+            Codec::AV1 => caps = caps.push(&mut av1_caps),
         }
 
         let result = unsafe {
@@ -185,9 +202,9 @@ fn query_detailed_capabilities(
             vk::VideoProfileListInfoKHR::default().profiles(std::slice::from_ref(&profile_info));
 
         // Check for Input Image support (VIDEO_ENCODE_SRC_KHR)
-        let mut format_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
-            .image_usage(vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR);
-        format_info.p_next = (&mut format_props_list as *mut vk::VideoProfileListInfoKHR).cast();
+        let format_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
+            .image_usage(vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR)
+            .push(&mut format_props_list);
 
         let result = unsafe {
             (video_queue_fn
@@ -220,9 +237,9 @@ fn query_detailed_capabilities(
         }
 
         // Check for DPB Image support (VIDEO_ENCODE_DPB_KHR)
-        let mut format_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
-            .image_usage(vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR);
-        format_info.p_next = (&mut format_props_list as *mut vk::VideoProfileListInfoKHR).cast();
+        let format_info = vk::PhysicalDeviceVideoFormatInfoKHR::default()
+            .image_usage(vk::ImageUsageFlags::VIDEO_ENCODE_DPB_KHR)
+            .push(&mut format_props_list);
 
         let mut format_props_count = 0;
         let result = unsafe {

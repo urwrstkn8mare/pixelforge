@@ -10,8 +10,9 @@ use crate::encoder::{ColorDescription, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
+use ash::vk::TaggedStructure;
 use std::ptr;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 impl AV1Encoder {
     /// Create a new AV1 encoder.
@@ -27,13 +28,6 @@ impl AV1Encoder {
 
         let width = config.dimensions.width;
         let height = config.dimensions.height;
-
-        warn!(
-            "AV1 encoding is experimental. On NVIDIA GPUs, P-frames cannot reference other \
-             P-frames, causing all P-frames to reference the I-frame instead. This leads to \
-             progressively larger frame sizes over time. Consider using H.264 or HEVC until \
-             this is resolved."
-        );
 
         info!(
             "Creating AV1 encoder: requested {}x{}, pixel_format={:?}",
@@ -69,22 +63,17 @@ impl AV1Encoder {
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_AV1)
             .chroma_subsampling(chroma_subsampling)
             .luma_bit_depth(luma_bit_depth)
-            .chroma_bit_depth(chroma_bit_depth);
-        profile_info.p_next =
-            (&mut av1_profile_info as *mut vk::VideoEncodeAV1ProfileInfoKHR).cast();
+            .chroma_bit_depth(chroma_bit_depth)
+            .push(&mut av1_profile_info);
 
         // Query encode capabilities.
         let video_queue_instance =
             ash::khr::video_queue::Instance::load(context.entry(), context.instance());
         let mut av1_capabilities = vk::VideoEncodeAV1CapabilitiesKHR::default();
-        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR {
-            p_next: (&mut av1_capabilities as *mut vk::VideoEncodeAV1CapabilitiesKHR).cast(),
-            ..Default::default()
-        };
-        let mut capabilities = vk::VideoCapabilitiesKHR {
-            p_next: (&mut encode_capabilities as *mut vk::VideoEncodeCapabilitiesKHR).cast(),
-            ..Default::default()
-        };
+        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR::default();
+        let mut capabilities = vk::VideoCapabilitiesKHR::default()
+            .push(&mut encode_capabilities)
+            .push(&mut av1_capabilities);
 
         let result = unsafe {
             (video_queue_instance
@@ -340,13 +329,14 @@ impl AV1Encoder {
                 vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BUFFER_OFFSET
                     | vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
             );
-        query_feedback_info.p_next = (&profile_info as *const vk::VideoProfileInfoKHR).cast();
 
-        let mut query_pool_create_info = vk::QueryPoolCreateInfo::default()
-            .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
-            .query_count(1);
-        query_pool_create_info.p_next =
-            (&query_feedback_info as *const vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR).cast();
+        let query_pool_create_info = unsafe {
+            vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
+                .query_count(1)
+                .push(&mut query_feedback_info)
+                .extend(&mut profile_info)
+        };
 
         let query_pool = unsafe {
             context

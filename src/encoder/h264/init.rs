@@ -13,6 +13,7 @@ use crate::encoder::PixelFormat;
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
 use ash::vk;
+use ash::vk::TaggedStructure;
 use std::ptr;
 use tracing::{debug, info};
 
@@ -66,13 +67,12 @@ impl H264Encoder {
         let mut h264_profile_info =
             vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(profile_idc);
 
-        let mut profile_info = vk::VideoProfileInfoKHR::default()
+        let profile_info = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
             .chroma_subsampling(chroma_subsampling)
             .luma_bit_depth(luma_bit_depth)
-            .chroma_bit_depth(chroma_bit_depth);
-        profile_info.p_next =
-            (&mut h264_profile_info as *mut vk::VideoEncodeH264ProfileInfoKHR).cast();
+            .chroma_bit_depth(chroma_bit_depth)
+            .push(&mut h264_profile_info);
 
         // Query encode capabilities for the selected profile and use them to derive a safe
         // coded extent and DPB limits. This mirrors vk_video_samples and avoids device loss
@@ -80,14 +80,14 @@ impl H264Encoder {
         let video_queue_instance =
             ash::khr::video_queue::Instance::load(context.entry(), context.instance());
         let mut h264_capabilities = vk::VideoEncodeH264CapabilitiesKHR::default();
-        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR {
-            p_next: (&mut h264_capabilities as *mut vk::VideoEncodeH264CapabilitiesKHR).cast(),
-            ..Default::default()
-        };
-        let mut capabilities = vk::VideoCapabilitiesKHR {
-            p_next: (&mut encode_capabilities as *mut vk::VideoEncodeCapabilitiesKHR).cast(),
-            ..Default::default()
-        };
+        let mut encode_capabilities = vk::VideoEncodeCapabilitiesKHR::default();
+
+        let h264_capabilities_dbg = h264_capabilities;
+        let encode_capabilities_dbg = encode_capabilities;
+
+        let mut capabilities = vk::VideoCapabilitiesKHR::default()
+            .push(&mut encode_capabilities)
+            .push(&mut h264_capabilities);
 
         let result = unsafe {
             (video_queue_instance
@@ -107,22 +107,22 @@ impl H264Encoder {
 
         debug!(
             "H.264 capabilities: maxLevelIdc={}, maxSliceCount={}, maxPPictureL0ReferenceCount={}, maxBPictureL0ReferenceCount={}, maxL1ReferenceCount={}, maxTemporalLayerCount={}, prefersGopRemainingFrames={}, requiresGopRemainingFrames={}, stdSyntaxFlags={:#010x}",
-            h264_capabilities.max_level_idc,
-            h264_capabilities.max_slice_count,
-            h264_capabilities.max_p_picture_l0_reference_count,
-            h264_capabilities.max_b_picture_l0_reference_count,
-            h264_capabilities.max_l1_reference_count,
-            h264_capabilities.max_temporal_layer_count,
-            h264_capabilities.prefers_gop_remaining_frames,
-            h264_capabilities.requires_gop_remaining_frames,
-            h264_capabilities.std_syntax_flags.as_raw(),
+            h264_capabilities_dbg.max_level_idc,
+            h264_capabilities_dbg.max_slice_count,
+            h264_capabilities_dbg.max_p_picture_l0_reference_count,
+            h264_capabilities_dbg.max_b_picture_l0_reference_count,
+            h264_capabilities_dbg.max_l1_reference_count,
+            h264_capabilities_dbg.max_temporal_layer_count,
+            h264_capabilities_dbg.prefers_gop_remaining_frames,
+            h264_capabilities_dbg.requires_gop_remaining_frames,
+            h264_capabilities_dbg.std_syntax_flags.as_raw(),
         );
         debug!(
             "Encode capabilities: encodeInputPictureGranularity={}x{}, supportedEncodeFeedbackFlags={:#010x}, maxQualityLevels={}",
-            encode_capabilities.encode_input_picture_granularity.width,
-            encode_capabilities.encode_input_picture_granularity.height,
-            encode_capabilities.supported_encode_feedback_flags.as_raw(),
-            encode_capabilities.max_quality_levels,
+            encode_capabilities_dbg.encode_input_picture_granularity.width,
+            encode_capabilities_dbg.encode_input_picture_granularity.height,
+            encode_capabilities_dbg.supported_encode_feedback_flags.as_raw(),
+            encode_capabilities_dbg.max_quality_levels,
         );
         debug!(
             "Video capabilities: flags={:#010x}, minBitstreamBufferOffsetAlignment={}, minBitstreamBufferSizeAlignment={}, minCodedExtent={}x{}, maxCodedExtent={}x{}, maxDpbSlots={}, maxActiveReferencePictures={}, pictureAccessGranularity={}x{}",
@@ -144,12 +144,8 @@ impl H264Encoder {
             ash::khr::video_encode_queue::Instance::load(context.entry(), context.instance());
         let mut h264_quality_level_properties =
             vk::VideoEncodeH264QualityLevelPropertiesKHR::default();
-        let mut quality_level_properties = vk::VideoEncodeQualityLevelPropertiesKHR {
-            p_next: (&mut h264_quality_level_properties
-                as *mut vk::VideoEncodeH264QualityLevelPropertiesKHR)
-                .cast(),
-            ..Default::default()
-        };
+        let mut quality_level_properties = vk::VideoEncodeQualityLevelPropertiesKHR::default()
+            .push(&mut h264_quality_level_properties);
         let quality_level_info = vk::PhysicalDeviceVideoEncodeQualityLevelInfoKHR::default()
             .video_profile(&profile_info)
             .quality_level(0);
@@ -410,13 +406,12 @@ impl H264Encoder {
         // Create profile info for images/buffers.
         let mut h264_profile_for_resources =
             vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(profile_idc);
-        let mut profile_for_resources = vk::VideoProfileInfoKHR::default()
+        let profile_for_resources = vk::VideoProfileInfoKHR::default()
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
             .chroma_subsampling(chroma_subsampling)
             .luma_bit_depth(luma_bit_depth)
-            .chroma_bit_depth(chroma_bit_depth);
-        profile_for_resources.p_next =
-            (&mut h264_profile_for_resources as *mut vk::VideoEncodeH264ProfileInfoKHR).cast();
+            .chroma_bit_depth(chroma_bit_depth)
+            .push(&mut h264_profile_for_resources);
 
         // Create input image.
         let (input_image, input_image_memory, input_image_view) = create_image(
@@ -494,9 +489,8 @@ impl H264Encoder {
             .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
             .chroma_subsampling(chroma_subsampling)
             .luma_bit_depth(luma_bit_depth)
-            .chroma_bit_depth(chroma_bit_depth);
-        profile_info_query.p_next =
-            (&mut h264_profile_info_query as *mut vk::VideoEncodeH264ProfileInfoKHR).cast();
+            .chroma_bit_depth(chroma_bit_depth)
+            .push(&mut h264_profile_info_query);
 
         let mut encode_feedback_create = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default()
             .encode_feedback_flags(
@@ -504,15 +498,13 @@ impl H264Encoder {
                     | vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
             );
 
-        encode_feedback_create.p_next =
-            (&mut profile_info_query as *mut vk::VideoProfileInfoKHR).cast();
-
-        let mut query_pool_create_info = vk::QueryPoolCreateInfo::default()
-            .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
-            .query_count(1);
-        query_pool_create_info.p_next = (&mut encode_feedback_create
-            as *mut vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR)
-            .cast();
+        let query_pool_create_info = unsafe {
+            vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
+                .query_count(1)
+                .extend(&mut profile_info_query)
+                .push(&mut encode_feedback_create)
+        };
 
         let query_pool = unsafe {
             context

@@ -3,6 +3,7 @@ use super::AV1Encoder;
 use crate::encoder::{BitDepth, ColorDescription, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
+use ash::vk::TaggedStructure;
 use std::ptr;
 
 impl AV1Encoder {
@@ -154,15 +155,10 @@ impl AV1Encoder {
                 .std_operating_points(std::slice::from_ref(&operating_point));
 
         let mut quality_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
-        quality_info.p_next = (&mut av1_session_params_create_info
-            as *mut vk::VideoEncodeAV1SessionParametersCreateInfoKHR)
-            .cast();
-
-        let session_params_create_info = vk::VideoSessionParametersCreateInfoKHR {
-            video_session: self.session,
-            p_next: (&mut quality_info as *mut vk::VideoEncodeQualityLevelInfoKHR).cast(),
-            ..Default::default()
-        };
+        let session_params_create_info = vk::VideoSessionParametersCreateInfoKHR::default()
+            .video_session(self.session)
+            .push(&mut quality_info)
+            .push(&mut av1_session_params_create_info);
 
         let session_params = unsafe {
             self.video_queue_fn

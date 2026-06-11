@@ -3,6 +3,7 @@ use super::H265Encoder;
 use crate::encoder::{BitDepth, ColorDescription, PixelFormat};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
+use ash::vk::TaggedStructure;
 use std::ptr;
 
 impl H265Encoder {
@@ -333,14 +334,11 @@ impl H265Encoder {
                 .parameters_add_info(&h265_add_info);
 
         let mut quality_level_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
-        quality_level_info.p_next = (&mut h265_params_create_info
-            as *mut vk::VideoEncodeH265SessionParametersCreateInfoKHR)
-            .cast();
 
-        let mut params_create_info =
-            vk::VideoSessionParametersCreateInfoKHR::default().video_session(self.session);
-        params_create_info.p_next =
-            (&mut quality_level_info as *mut vk::VideoEncodeQualityLevelInfoKHR).cast();
+        let params_create_info = vk::VideoSessionParametersCreateInfoKHR::default()
+            .video_session(self.session)
+            .push(&mut h265_params_create_info)
+            .push(&mut quality_level_info);
 
         let mut session_params = vk::VideoSessionParametersKHR::null();
         let result = unsafe {

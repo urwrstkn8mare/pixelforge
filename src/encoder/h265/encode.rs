@@ -11,6 +11,7 @@ use crate::encoder::resources::{
 };
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
+use ash::vk::TaggedStructure;
 use tracing::debug;
 
 impl H265Encoder {
@@ -356,22 +357,20 @@ impl H265Encoder {
         let mut h265_setup_dpb_slot_info =
             vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&std_reference_info);
 
-        let mut setup_slot_info = vk::VideoReferenceSlotInfoKHR::default()
+        let setup_slot_info = vk::VideoReferenceSlotInfoKHR::default()
             .slot_index(self.current_dpb_slot as i32)
-            .picture_resource(&setup_picture_resource);
-        setup_slot_info.p_next =
-            (&mut h265_setup_dpb_slot_info as *mut vk::VideoEncodeH265DpbSlotInfoKHR).cast();
+            .picture_resource(&setup_picture_resource)
+            .push(&mut h265_setup_dpb_slot_info);
 
         // Setup slot for begin - always use -1 to indicate it's not yet active.
         // (it will be written to during encoding)
         let mut h265_begin_dpb_slot_info =
             vk::VideoEncodeH265DpbSlotInfoKHR::default().std_reference_info(&std_reference_info);
 
-        let mut setup_slot_for_begin = vk::VideoReferenceSlotInfoKHR::default()
+        let setup_slot_for_begin = vk::VideoReferenceSlotInfoKHR::default()
             .slot_index(-1) // Always -1 for setup slot
-            .picture_resource(&setup_picture_resource);
-        setup_slot_for_begin.p_next =
-            (&mut h265_begin_dpb_slot_info as *mut vk::VideoEncodeH265DpbSlotInfoKHR).cast();
+            .picture_resource(&setup_picture_resource)
+            .push(&mut h265_begin_dpb_slot_info);
 
         // Set up reference slots.
 
@@ -444,36 +443,33 @@ impl H265Encoder {
         // Re-construct the list of DPB slots to assign correct slot_index.
 
         let mut stored_indices_count = 0;
+        let mut slot_infos_iter = h265_slot_infos.iter_mut();
+
         if has_l0_ref {
             for ref_info in &self.l0_references {
-                let mut ref_slot = vk::VideoReferenceSlotInfoKHR::default()
-                    .slot_index(ref_info.dpb_slot as i32)
-                    .picture_resource(&ref_resources[stored_indices_count]);
+                if let Some(h265_slot_info) = slot_infos_iter.next() {
+                    let ref_slot = vk::VideoReferenceSlotInfoKHR::default()
+                        .slot_index(ref_info.dpb_slot as i32)
+                        .picture_resource(&ref_resources[stored_indices_count])
+                        .push(h265_slot_info);
 
-                ref_slot.p_next = (&mut h265_slot_infos[stored_indices_count]
-                    as *mut vk::VideoEncodeH265DpbSlotInfoKHR)
-                    .cast();
-
-                reference_slots.push(ref_slot);
-                reference_slots_for_begin.push(ref_slot);
-
-                stored_indices_count += 1;
+                    reference_slots.push(ref_slot);
+                    reference_slots_for_begin.push(ref_slot);
+                    stored_indices_count += 1;
+                }
             }
         }
 
         if has_l1_ref {
-            let mut ref_slot = vk::VideoReferenceSlotInfoKHR::default()
-                .slot_index(self.backward_reference_dpb_slot as i32)
-                .picture_resource(&ref_resources[stored_indices_count]);
+            if let Some(h265_slot_info) = slot_infos_iter.next() {
+                let ref_slot = vk::VideoReferenceSlotInfoKHR::default()
+                    .slot_index(self.backward_reference_dpb_slot as i32)
+                    .picture_resource(&ref_resources[stored_indices_count])
+                    .push(h265_slot_info);
 
-            ref_slot.p_next = (&mut h265_slot_infos[stored_indices_count]
-                as *mut vk::VideoEncodeH265DpbSlotInfoKHR)
-                .cast();
-
-            reference_slots.push(ref_slot);
-            reference_slots_for_begin.push(ref_slot);
-
-            // stored_indices_count += 1; // Not needed anymore
+                reference_slots.push(ref_slot);
+                reference_slots_for_begin.push(ref_slot);
+            }
         }
 
         // Rate control setup.
@@ -525,13 +521,12 @@ impl H265Encoder {
             .min_qp(min_qp)
             .max_qp(max_qp);
 
-        let mut rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
+        let rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
             .average_bitrate(average_bitrate as u64)
             .max_bitrate(max_bitrate as u64)
             .frame_rate_numerator(self.config.frame_rate_numerator)
-            .frame_rate_denominator(self.config.frame_rate_denominator);
-        rc_layer_info.p_next =
-            (&mut h265_rc_layer_info as *mut vk::VideoEncodeH265RateControlLayerInfoKHR).cast();
+            .frame_rate_denominator(self.config.frame_rate_denominator)
+            .push(&mut h265_rc_layer_info);
 
         let rc_layers = [rc_layer_info];
 
@@ -547,8 +542,6 @@ impl H265Encoder {
                 .layers(&rc_layers)
                 .virtual_buffer_size_in_ms(self.config.virtual_buffer_size_ms)
                 .initial_virtual_buffer_size_in_ms(self.config.initial_virtual_buffer_size_ms);
-            rc_info.p_next =
-                (&mut h265_rc_info as *mut vk::VideoEncodeH265RateControlInfoKHR).cast();
         }
 
         // Begin video coding.
@@ -559,13 +552,14 @@ impl H265Encoder {
                 .video_session(self.session)
                 .video_session_parameters(self.session_params)
                 .reference_slots(&reference_slots_for_begin)
+                .push(&mut h265_rc_info)
         } else {
-            let mut info = vk::VideoBeginCodingInfoKHR::default()
+            vk::VideoBeginCodingInfoKHR::default()
                 .video_session(self.session)
                 .video_session_parameters(self.session_params)
-                .reference_slots(&reference_slots_for_begin);
-            info.p_next = (&mut rc_info as *mut vk::VideoEncodeRateControlInfoKHR).cast();
-            info
+                .reference_slots(&reference_slots_for_begin)
+                .push(&mut h265_rc_info)
+                .push(&mut rc_info)
         };
 
         unsafe {
@@ -581,16 +575,16 @@ impl H265Encoder {
         if is_first_frame {
             let mut quality_level_info =
                 vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(0);
-            quality_level_info.p_next =
-                (&mut rc_info as *mut vk::VideoEncodeRateControlInfoKHR).cast();
 
-            let mut control_info = vk::VideoCodingControlInfoKHR::default().flags(
-                vk::VideoCodingControlFlagsKHR::RESET
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
-                    | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
-            );
-            control_info.p_next =
-                (&mut quality_level_info as *mut vk::VideoEncodeQualityLevelInfoKHR).cast();
+            let control_info = vk::VideoCodingControlInfoKHR::default()
+                .flags(
+                    vk::VideoCodingControlFlagsKHR::RESET
+                        | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+                        | vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL,
+                )
+                .push(&mut rc_info)
+                .push(&mut h265_rc_info)
+                .push(&mut quality_level_info);
 
             unsafe {
                 (self.video_queue_fn.fp().cmd_control_video_coding_khr)(
@@ -601,16 +595,15 @@ impl H265Encoder {
         }
 
         // Encode command.
-        let mut encode_info = vk::VideoEncodeInfoKHR::default()
+        let encode_info = vk::VideoEncodeInfoKHR::default()
             .flags(vk::VideoEncodeFlagsKHR::empty())
             .src_picture_resource(src_picture_resource)
             .setup_reference_slot(&setup_slot_info)
             .reference_slots(&reference_slots)
             .dst_buffer(self.bitstream_buffer)
             .dst_buffer_offset(0)
-            .dst_buffer_range(MIN_BITSTREAM_BUFFER_SIZE as u64);
-        encode_info.p_next =
-            (&mut h265_picture_info as *mut vk::VideoEncodeH265PictureInfoKHR).cast();
+            .dst_buffer_range(MIN_BITSTREAM_BUFFER_SIZE as u64)
+            .push(&mut h265_picture_info);
 
         unsafe {
             self.context.device().cmd_begin_query(
