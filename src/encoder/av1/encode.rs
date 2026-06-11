@@ -329,21 +329,24 @@ impl AV1Encoder {
         }
 
         // AV1-specific rate control layer info.
-        let min_q_index = vk::VideoEncodeAV1QIndexKHR {
-            intra_q_index: qp,
-            predictive_q_index: qp,
-            bipredictive_q_index: qp,
-        };
-        let max_q_index = vk::VideoEncodeAV1QIndexKHR {
-            intra_q_index: qp,
-            predictive_q_index: qp,
-            bipredictive_q_index: qp,
-        };
-        let mut av1_rc_layer_info = vk::VideoEncodeAV1RateControlLayerInfoKHR::default()
-            .use_min_q_index(true)
-            .min_q_index(min_q_index)
-            .use_max_q_index(true)
-            .max_q_index(max_q_index);
+        let mut av1_rc_layer_info = vk::VideoEncodeAV1RateControlLayerInfoKHR::default();
+        if rc_mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED {
+            let q_index = vk::VideoEncodeAV1QIndexKHR {
+                intra_q_index: qp,
+                predictive_q_index: qp,
+                bipredictive_q_index: qp,
+            };
+            av1_rc_layer_info = av1_rc_layer_info
+                .use_min_q_index(true)
+                .min_q_index(q_index)
+                .use_max_q_index(true)
+                .max_q_index(q_index);
+        } else {
+            // In CBR/VBR, let device handle QP
+            av1_rc_layer_info = av1_rc_layer_info
+                .use_min_q_index(false)
+                .use_max_q_index(false);
+        }
 
         let rc_layer_info = vk::VideoEncodeRateControlLayerInfoKHR::default()
             .average_bitrate(average_bitrate as u64)
