@@ -7,7 +7,6 @@
 //! CPU round-trips when used with a GPU-based video encoder.
 
 mod pipeline;
-mod shader;
 
 use crate::error::{PixelForgeError, Result};
 use crate::vulkan::VideoContext;
@@ -26,6 +25,10 @@ pub enum ColorSpace {
     /// Used for SDR content during HDR streaming sessions.
     /// Applies: inverse sRGB EOTF → BT.709→BT.2020 gamut mapping → PQ OETF.
     SrgbToBt2020Pq,
+    /// scRGB input (linear BT.709, FP16) converted to BT.2020 + PQ output.
+    /// Used for HDR games submitting a `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT` swapchain.
+    /// Applies: BT.709→BT.2020 gamut mapping → PQ OETF. No EOTF decode — input is already linear.
+    Bt709LinearToBt2020Pq,
 }
 
 /// Supported input pixel formats for color conversion.
@@ -47,10 +50,13 @@ pub enum InputFormat {
     /// Maps to DRM_FORMAT_ABGR16161616F / VK_FORMAT_R16G16B16A16_SFLOAT.
     ///
     /// The converter treats FP16 data the same as other formats: passthrough
-    /// for `ColorSpace::Bt709` / `Bt2020`, and sRGB→BT.2020+PQ conversion
-    /// for `ColorSpace::SrgbToBt2020Pq`. No linear→PQ transfer function is
-    /// applied automatically; if the source is PQ-encoded (e.g. via the
-    /// gamescope WSI layer), use `ColorSpace::Bt2020` for passthrough.
+    /// for `ColorSpace::Bt709` / `Bt2020`, sRGB→BT.2020+PQ conversion for
+    /// `ColorSpace::SrgbToBt2020Pq`, and scRGB-linear→BT.2020+PQ for
+    /// `ColorSpace::Bt709LinearToBt2020Pq` (the natural pairing for FP16 input
+    /// from an `EXTENDED_SRGB_LINEAR_EXT` swapchain). No linear→PQ transfer
+    /// function is applied automatically; if the source is PQ-encoded
+    /// (e.g. via the gamescope WSI layer), use `ColorSpace::Bt2020` for
+    /// passthrough.
     RGBA16F,
 }
 
@@ -163,7 +169,8 @@ pub struct ColorConverterConfig {
     /// SDR reference white level in nits for the sRGB→BT.2020+PQ conversion.
     ///
     /// Per ITU-R BT.2408 the standard value is 203 nits.
-    /// Only used when `color_space` is `SrgbToBt2020Pq`.
+    /// Only used when `color_space` is `SrgbToBt2020Pq` or `Bt709LinearToBt2020Pq`
+    /// (for the latter, the scRGB spec defines 1.0 == 80 cd/m²).
     pub sdr_reference_white_nits: f32,
 }
 
@@ -206,25 +213,27 @@ pub struct ColorConverter {
     // Cached ImageView for the source image (avoids per-frame recreation).
     cached_src_view: Option<(vk::Image, vk::ImageView)>,
 
-    // Output buffer (compute shader writes here)
+    // Output buffer (compute shader writes here).
     output_buffer: vk::Buffer,
     output_memory: vk::DeviceMemory,
+    // Output buffer size and device address. The address is fed into
+    // `VkDescriptorAddressInfoEXT` when populating the binding-1 descriptor.
+    output_buffer_size: usize,
+    output_buffer_address: vk::DeviceAddress,
 
-    // Descriptor buffer (holds captured descriptor data).
+    // Descriptor buffer (mapped, descriptors are written here per-frame).
     descriptor_buffer: vk::Buffer,
     descriptor_buffer_memory: vk::DeviceMemory,
     descriptor_buffer_address: vk::DeviceAddress,
     descriptor_buffer_usage: vk::BufferUsageFlags,
     descriptor_buffer_ptr: *mut u8,
-    sampler_capture_size: u32,
-    image_capture_size: u32,
-    buffer_capture_size: u32,
-    // Cached descriptor buffer device and per-frame capture buffers.
+    // Descriptor sizes for each binding type, queried from
+    // `VkPhysicalDeviceDescriptorBufferPropertiesEXT`.
+    combined_image_sampler_descriptor_size: usize,
+    storage_buffer_descriptor_size: usize,
+    // Loaded descriptor-buffer extension device for `vkGetDescriptorEXT`.
     ext_device: ash::ext::descriptor_buffer::Device,
-    sampler_data: Vec<u8>,
-    image_data: Vec<u8>,
-    buffer_data: Vec<u8>,
-    // Descriptor set layout binding offsets for correct payload placement.
+    // Per-binding offsets within the descriptor buffer.
     binding0_offset: u64,
     binding1_offset: u64,
 
@@ -274,6 +283,15 @@ impl ColorConverter {
     /// since the full-range flag is passed via push constants.
     pub fn set_full_range(&mut self, full_range: bool) {
         self.config.full_range = full_range;
+    }
+
+    /// Set the SDR reference white level for subsequent conversions.
+    ///
+    /// This takes effect on the next `convert()` call without recreating the pipeline,
+    /// since the value is passed via push constants.  Only consumed by the
+    /// `SrgbToBt2020Pq` and `Bt709LinearToBt2020Pq` color spaces.
+    pub fn set_sdr_reference_white_nits(&mut self, nits: f32) {
+        self.config.sdr_reference_white_nits = nits;
     }
 
     /// Build buffer-to-image copy regions for multi-planar YUV formats.
@@ -641,74 +659,54 @@ impl ColorConverter {
                 self.pipeline,
             );
 
-            // --- Opaque capture descriptors into descriptor buffer ---
-            // 1. Capture sampler descriptor data into preallocated buffer.
-            let sampler_capture_info =
-                vk::SamplerCaptureDescriptorDataInfoEXT::default().sampler(self.sampler);
-            self.ext_device
-                .get_sampler_opaque_capture_descriptor_data(
-                    &sampler_capture_info,
-                    self.sampler_data.as_mut_slice(),
-                )
-                .map_err(|e| PixelForgeError::CommandBuffer(format!("sampler capture: {}", e)))?;
-
-            // 2. Capture image view descriptor data into preallocated buffer.
-            let image_capture_info =
-                vk::ImageViewCaptureDescriptorDataInfoEXT::default().image_view(src_view);
-            self.ext_device
-                .get_image_view_opaque_capture_descriptor_data(
-                    &image_capture_info,
-                    self.image_data.as_mut_slice(),
-                )
-                .map_err(|e| {
-                    PixelForgeError::CommandBuffer(format!("image view capture: {}", e))
-                })?;
-
-            // 3. Capture output buffer descriptor data into preallocated buffer.
-            let buffer_capture_info =
-                vk::BufferCaptureDescriptorDataInfoEXT::default().buffer(self.output_buffer);
-            self.ext_device
-                .get_buffer_opaque_capture_descriptor_data(
-                    &buffer_capture_info,
-                    self.buffer_data.as_mut_slice(),
-                )
-                .map_err(|e| PixelForgeError::CommandBuffer(format!("buffer capture: {}", e)))?;
-
-            // 4. Write captured data into descriptor buffer (persistent map, HOST_COHERENT).
+            // --- Populate descriptors directly into the descriptor buffer ---
             //
-            // The descriptor buffer capture functions return driver-defined descriptor payloads
-            // in the format expected by the descriptor buffer. For combined image sampler
-            // descriptors (binding 0), the sampler and image view captures are placed
-            // consecutively at the binding's offset.
+            // Use `vkGetDescriptorEXT` for runtime descriptor population. (The
+            // previous implementation mistakenly used the
+            // `vkGet*OpaqueCaptureDescriptorDataEXT` family — those produce
+            // opaque payloads for capture/replay tooling and are NOT the
+            // descriptor data the GPU consumes at binding offsets, which made
+            // the compute shader read garbage and emit constant-Y output —
+            // visible as a green-screen stream.)
             //
-            // Layout:
-            //   Offset binding0_offset: Sampler + image view capture payloads (binding 0)
-            //   Offset binding1_offset: Buffer capture payload (binding 1)
+            // The descriptor buffer is persistent-mapped HOST_COHERENT, so a
+            // plain memcpy via the slice handed to `get_descriptor` is enough.
 
-            let sampler_offset = self.binding0_offset as usize;
-            let image_offset = sampler_offset + self.sampler_capture_size as usize;
-            let buffer_offset = self.binding1_offset as usize;
-
-            // Write sampler capture payload.
-            std::ptr::copy_nonoverlapping(
-                self.sampler_data.as_ptr(),
-                self.descriptor_buffer_ptr.add(sampler_offset),
-                self.sampler_capture_size as usize,
+            // Binding 0: COMBINED_IMAGE_SAMPLER (sampler + image view).
+            let image_info = vk::DescriptorImageInfo::default()
+                .sampler(self.sampler)
+                .image_view(src_view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            let combined_get_info = vk::DescriptorGetInfoEXT::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .data(vk::DescriptorDataEXT {
+                    p_combined_image_sampler: &image_info,
+                });
+            let combined_dst = std::slice::from_raw_parts_mut(
+                self.descriptor_buffer_ptr
+                    .add(self.binding0_offset as usize),
+                self.combined_image_sampler_descriptor_size,
             );
+            self.ext_device
+                .get_descriptor(&combined_get_info, combined_dst);
 
-            // Write image view capture payload.
-            std::ptr::copy_nonoverlapping(
-                self.image_data.as_ptr(),
-                self.descriptor_buffer_ptr.add(image_offset),
-                self.image_capture_size as usize,
+            // Binding 1: STORAGE_BUFFER (output YUV).
+            let buffer_addr_info = vk::DescriptorAddressInfoEXT::default()
+                .address(self.output_buffer_address)
+                .range(self.output_buffer_size as u64)
+                .format(vk::Format::UNDEFINED);
+            let storage_get_info = vk::DescriptorGetInfoEXT::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .data(vk::DescriptorDataEXT {
+                    p_storage_buffer: &buffer_addr_info,
+                });
+            let storage_dst = std::slice::from_raw_parts_mut(
+                self.descriptor_buffer_ptr
+                    .add(self.binding1_offset as usize),
+                self.storage_buffer_descriptor_size,
             );
-
-            // Write buffer capture payload.
-            std::ptr::copy_nonoverlapping(
-                self.buffer_data.as_ptr(),
-                self.descriptor_buffer_ptr.add(buffer_offset),
-                self.buffer_capture_size as usize,
-            );
+            self.ext_device
+                .get_descriptor(&storage_get_info, storage_dst);
 
             // --- Bind descriptor buffers ---
             let binding_info = vk::DescriptorBufferBindingInfoEXT::default()
@@ -1009,10 +1007,11 @@ mod tests {
     #[test]
     fn test_color_space_enum_values() {
         // Verify enum values match shader push constant expectations:
-        // 0=BT.709, 1=BT.2020, 2=sRGB→BT.2020+PQ.
+        // 0=BT.709, 1=BT.2020, 2=sRGB→BT.2020+PQ, 3=scRGB (BT.709 linear)→BT.2020+PQ.
         assert_eq!(ColorSpace::Bt709 as u32, 0);
         assert_eq!(ColorSpace::Bt2020 as u32, 1);
         assert_eq!(ColorSpace::SrgbToBt2020Pq as u32, 2);
+        assert_eq!(ColorSpace::Bt709LinearToBt2020Pq as u32, 3);
     }
 
     // ========================

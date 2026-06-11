@@ -1,6 +1,6 @@
 [package]
 name = "pixelforge"
-version = "0.3.0"
+version = "0.5.0"
 edition = "2021"
 description = "A Vulkan-based video encoding library for Rust"
 license = "BSD-2-Clause"
@@ -17,7 +17,6 @@ dmabuf = []
 ash = { git = "https://github.com/ash-rs/ash", rev = "55dd56906bbb5760e9e9e6c56f45be67f67e0649", features = ["loaded"] }
 thiserror = "1.0"
 tracing = "0.1"
-shaderc = "0.8"
 
 [dev-dependencies]
 env_logger = "0.11"
