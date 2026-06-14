@@ -3,7 +3,6 @@ use super::AV1Encoder;
 use crate::encoder::gop::GopPosition;
 use crate::encoder::resources::{
     prepare_encode_command_buffer, record_dpb_barriers, record_post_encode_dpb_barrier,
-    submit_encode_and_read_bitstream,
 };
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
@@ -15,7 +14,14 @@ impl AV1Encoder {
         &mut self,
         _gop_position: &GopPosition,
         is_key_frame: bool,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<()> {
+        let slot = self.pipeline.current();
+        let command_buffer = slot.encode_command_buffer;
+        let query_pool = slot.query_pool;
+        let bitstream_buffer = slot.bitstream_buffer;
+        let bitstream_buffer_size = slot.bitstream_buffer_size;
+        let input_image_view = slot.input_image_view;
+
         // All frames need a setup reference slot (DPB write) per Vulkan spec when maxDpbSlots > 0.
         let is_reference = true;
 
@@ -51,11 +57,7 @@ impl AV1Encoder {
 
         // Prepare command buffer for recording.
         unsafe {
-            prepare_encode_command_buffer(
-                self.context.device(),
-                self.encode_command_buffer,
-                self.query_pool,
-            )?;
+            prepare_encode_command_buffer(self.context.device(), command_buffer, query_pool)?;
         }
 
         // Transition DPB images for encode.
@@ -63,7 +65,7 @@ impl AV1Encoder {
         unsafe {
             record_dpb_barriers(
                 self.context.device(),
-                self.encode_command_buffer,
+                command_buffer,
                 &self.dpb_images,
                 false, // AV1 does not use layered DPB
                 self.current_dpb_slot,
@@ -406,7 +408,7 @@ impl AV1Encoder {
 
         unsafe {
             self.video_queue_fn
-                .cmd_begin_video_coding(self.encode_command_buffer, &begin_coding_info);
+                .cmd_begin_video_coding(command_buffer, &begin_coding_info);
         }
 
         // Reset video coding state for the first frame.
@@ -428,7 +430,7 @@ impl AV1Encoder {
 
             unsafe {
                 self.video_queue_fn
-                    .cmd_control_video_coding(self.encode_command_buffer, &control_info);
+                    .cmd_control_video_coding(command_buffer, &control_info);
             }
         }
 
@@ -437,13 +439,13 @@ impl AV1Encoder {
             .coded_offset(vk::Offset2D { x: 0, y: 0 })
             .coded_extent(frame_extent)
             .base_array_layer(0)
-            .image_view_binding(self.input_image_view);
+            .image_view_binding(input_image_view);
 
         let mut encode_info = vk::VideoEncodeInfoKHR::default()
             .src_picture_resource(src_picture_resource)
-            .dst_buffer(self.bitstream_buffer)
+            .dst_buffer(bitstream_buffer)
             .dst_buffer_offset(0)
-            .dst_buffer_range(self.bitstream_buffer_size as u64);
+            .dst_buffer_range(bitstream_buffer_size as u64);
 
         if is_reference {
             encode_info = encode_info.setup_reference_slot(&setup_reference_slot);
@@ -458,8 +460,8 @@ impl AV1Encoder {
         // Begin query to capture encode feedback (bitstream size, status).
         unsafe {
             self.context.device().cmd_begin_query(
-                self.encode_command_buffer,
-                self.query_pool,
+                command_buffer,
+                query_pool,
                 0,
                 vk::QueryControlFlags::empty(),
             );
@@ -467,21 +469,21 @@ impl AV1Encoder {
 
         unsafe {
             self.video_encode_fn
-                .cmd_encode_video(self.encode_command_buffer, &encode_info);
+                .cmd_encode_video(command_buffer, &encode_info);
         }
 
         // End query.
         unsafe {
             self.context
                 .device()
-                .cmd_end_query(self.encode_command_buffer, self.query_pool, 0);
+                .cmd_end_query(command_buffer, query_pool, 0);
         }
 
         // Add DPB synchronization barrier after encoding.
         unsafe {
             record_post_encode_dpb_barrier(
                 self.context.device(),
-                self.encode_command_buffer,
+                command_buffer,
                 &self.dpb_images,
                 false, // AV1 does not use layered DPB
                 self.current_dpb_slot,
@@ -492,18 +494,14 @@ impl AV1Encoder {
         let end_coding_info = vk::VideoEndCodingInfoKHR::default();
         unsafe {
             self.video_queue_fn
-                .cmd_end_video_coding(self.encode_command_buffer, &end_coding_info);
+                .cmd_end_video_coding(command_buffer, &end_coding_info);
         }
 
         // End command buffer.
-        unsafe {
-            self.context
-                .device()
-                .end_command_buffer(self.encode_command_buffer)
-        }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        unsafe { self.context.device().end_command_buffer(command_buffer) }
+            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
-        // Submit, wait, and read bitstream.
+        // Submit without waiting; the slot is drained on a later encode call.
         let encode_queue = self.context.video_encode_queue().ok_or_else(|| {
             PixelForgeError::NoSuitableDevice("No video encode queue available".to_string())
         })?;
@@ -516,25 +514,13 @@ impl AV1Encoder {
             self.current_dpb_slot
         );
 
-        let gpu_start = std::time::Instant::now();
-
-        let encoded_data = unsafe {
-            submit_encode_and_read_bitstream(
-                self.context.device(),
-                self.encode_command_buffer,
-                self.encode_fence,
-                encode_queue,
-                self.query_pool,
-                self.bitstream_buffer_ptr,
-            )?
-        };
-
-        debug!("GPU encode took {:?}", gpu_start.elapsed());
+        self.pipeline
+            .submit_current(self.context.device(), encode_queue)?;
 
         // Mark current DPB slot as active.
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;
 
-        Ok(encoded_data)
+        Ok(())
     }
 
     /// Calculate proper reference frame mapping for AV1 encoding.

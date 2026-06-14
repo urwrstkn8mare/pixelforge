@@ -2,6 +2,7 @@ use super::H265Encoder;
 
 use crate::encoder::dpb::{DecodedPictureBufferTrait, DpbConfig, PictureStartInfo, PictureType};
 use crate::encoder::gop::{GopFrameType, GopPosition};
+use crate::encoder::pipeline::SlotPacketMetadata;
 use crate::encoder::{ColorDescription, EncodedPacket};
 use crate::error::Result;
 use crate::PixelForgeError;
@@ -15,7 +16,7 @@ impl H265Encoder {
     /// This image can be used as a target for `ColorConverter::convert` to avoid
     /// an intermediate copy.
     pub fn input_image(&self) -> vk::Image {
-        self.input_image
+        self.pipeline.input_image(self.context.device())
     }
 
     /// Encode a frame from a GPU image.
@@ -29,6 +30,7 @@ impl H265Encoder {
     /// The encoder will panic at creation time if B-frames are enabled (b_frame_count > 0),
     /// as B-frame encoding is not yet supported.
     pub fn encode(&mut self, src_image: vk::Image) -> Result<Vec<EncodedPacket>> {
+        let drained_packet = self.pipeline.drain_current(self.context.device())?;
         let gop_position = self.gop.get_next_frame();
         let display_order = self.input_frame_num;
         self.input_frame_num += 1;
@@ -41,10 +43,11 @@ impl H265Encoder {
         // Upload from GPU image.
         self.upload_from_image(src_image)?;
 
-        // Encode immediately.
-        let packet = self.encode_current_frame(&gop_position, display_order)?;
+        self.encode_current_frame(&gop_position, display_order)?;
 
-        Ok(vec![packet])
+        self.pipeline.advance();
+
+        Ok(drained_packet.into_iter().collect())
     }
 
     /// Internal method to encode the current frame already uploaded to input_image.
@@ -52,7 +55,7 @@ impl H265Encoder {
         &mut self,
         gop_position: &GopPosition,
         display_order: u64,
-    ) -> Result<EncodedPacket> {
+    ) -> Result<()> {
         let is_idr = gop_position.frame_type.is_idr();
         let is_reference = gop_position.is_reference;
         let is_b_frame = gop_position.frame_type == GopFrameType::B;
@@ -102,10 +105,8 @@ impl H265Encoder {
 
         let pic_order_cnt = gop_position.pic_order_cnt;
 
-        let mut encoded_data = Vec::new();
-
         // For IDR frames, prepend VPS/SPS/PPS header.
-        if is_idr {
+        let header = if is_idr {
             if self.header_data.is_none() {
                 let header = self.get_h265_header()?;
                 // Debug: print first few bytes of header.
@@ -116,21 +117,23 @@ impl H265Encoder {
                 );
                 self.header_data = Some(header);
             }
-            if let Some(ref header) = self.header_data {
-                encoded_data.extend_from_slice(header);
-            }
-        }
+            self.header_data.clone()
+        } else {
+            None
+        };
 
-        let slice_data = self.encode_frame_internal(gop_position, pic_order_cnt, is_idr)?;
-        // Debug: print first few bytes of slice data.
-        debug!(
-            "H.265 slice ({} bytes): {:02X?}",
-            slice_data.len(),
-            &slice_data[..std::cmp::min(16, slice_data.len())]
-        );
-        encoded_data.extend_from_slice(&slice_data);
+        self.encode_frame_internal(gop_position, pic_order_cnt, is_idr)?;
 
+        let dts = self.encode_frame_num;
         self.encode_frame_num += 1;
+
+        self.pipeline.set_pending_metadata(SlotPacketMetadata {
+            frame_type,
+            is_key_frame: is_idr,
+            pts: display_order,
+            dts,
+            header,
+        });
 
         if is_reference {
             let dpb_pic_type = if is_idr {
@@ -181,19 +184,12 @@ impl H265Encoder {
             }
         }
 
-        Ok(EncodedPacket {
-            data: encoded_data,
-            frame_type,
-            is_key_frame: is_idr,
-            pts: display_order,
-            dts: self.encode_frame_num - 1,
-        })
+        Ok(())
     }
 
     /// Flush the encoder and get any remaining packets.
     pub fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
-        // No buffered frames in the current implementation.
-        Ok(Vec::new())
+        self.pipeline.flush(self.context.device())
     }
 
     /// Request that the next frame be an IDR frame.
@@ -273,16 +269,15 @@ impl H265Encoder {
     /// The next encoded frame will be an IDR with the new VPS/SPS/PPS prepended.
     pub fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
         // Wait for any in-flight encode to complete before modifying session params.
-        // Do NOT reset the fence here — submit_encode_and_read_bitstream() resets it
-        // before queue_submit. Leaving the fence signaled allows consecutive
-        // set_color_description() calls without deadlock.
+        // Do not reset the fences here; submit resets each slot fence before reuse.
+        let fences = self.pipeline.encode_fences();
         unsafe {
             self.context
                 .device()
-                .wait_for_fences(&[self.encode_fence], true, u64::MAX)
+                .wait_for_fences(&fences, true, u64::MAX)
                 .map_err(|e| {
                     PixelForgeError::Synchronization(format!(
-                        "Failed to wait for encode fence: {:?}",
+                        "Failed to wait for encode fences: {:?}",
                         e
                     ))
                 })?;

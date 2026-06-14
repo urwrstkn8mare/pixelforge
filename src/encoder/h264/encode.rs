@@ -1,10 +1,7 @@
 use super::H264Encoder;
 
 use crate::encoder::gop::{GopFrameType, GopPosition};
-use crate::encoder::resources::{
-    prepare_encode_command_buffer, record_dpb_barriers, submit_encode_and_read_bitstream,
-    MIN_BITSTREAM_BUFFER_SIZE,
-};
+use crate::encoder::resources::{prepare_encode_command_buffer, record_dpb_barriers};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
 use ash::vk::TaggedStructure;
@@ -17,7 +14,14 @@ impl H264Encoder {
         frame_num: u32,
         pic_order_cnt: i32,
         is_idr: bool,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<()> {
+        let slot = self.pipeline.current();
+        let command_buffer = slot.encode_command_buffer;
+        let query_pool = slot.query_pool;
+        let bitstream_buffer = slot.bitstream_buffer;
+        let bitstream_buffer_size = slot.bitstream_buffer_size;
+        let input_image_view = slot.input_image_view;
+
         let is_b_frame = gop_position.frame_type == GopFrameType::B;
         let is_reference = gop_position.is_reference;
 
@@ -54,11 +58,7 @@ impl H264Encoder {
 
         // Prepare command buffer for recording.
         unsafe {
-            prepare_encode_command_buffer(
-                self.context.device(),
-                self.encode_command_buffer,
-                self.query_pool,
-            )?;
+            prepare_encode_command_buffer(self.context.device(), command_buffer, query_pool)?;
         }
 
         // Transition DPB images for encode.
@@ -66,7 +66,7 @@ impl H264Encoder {
         unsafe {
             record_dpb_barriers(
                 self.context.device(),
-                self.encode_command_buffer,
+                command_buffer,
                 &self.dpb_images,
                 self.use_layered_dpb,
                 self.current_dpb_slot,
@@ -264,7 +264,7 @@ impl H264Encoder {
                 height: self.aligned_height,
             })
             .base_array_layer(0)
-            .image_view_binding(self.input_image_view);
+            .image_view_binding(input_image_view);
 
         // Set up DPB slot for reconstructed picture (setup slot)
         let setup_picture_resource = vk::VideoPictureResourceInfoKHR::default()
@@ -432,9 +432,9 @@ impl H264Encoder {
         }
 
         let mut encode_info = vk::VideoEncodeInfoKHR::default()
-            .dst_buffer(self.bitstream_buffer)
+            .dst_buffer(bitstream_buffer)
             .dst_buffer_offset(0)
-            .dst_buffer_range(MIN_BITSTREAM_BUFFER_SIZE as vk::DeviceSize)
+            .dst_buffer_range(bitstream_buffer_size as vk::DeviceSize)
             .src_picture_resource(src_picture_resource)
             .setup_reference_slot(&setup_reference_slot);
 
@@ -535,10 +535,7 @@ impl H264Encoder {
         };
 
         unsafe {
-            (self.video_queue_fn.fp().cmd_begin_video_coding_khr)(
-                self.encode_command_buffer,
-                &begin_info,
-            );
+            (self.video_queue_fn.fp().cmd_begin_video_coding_khr)(command_buffer, &begin_info);
         }
 
         // Reset video coding state for the first frame.
@@ -560,7 +557,7 @@ impl H264Encoder {
 
             unsafe {
                 (self.video_queue_fn.fp().cmd_control_video_coding_khr)(
-                    self.encode_command_buffer,
+                    command_buffer,
                     &control_info,
                 );
             }
@@ -569,8 +566,8 @@ impl H264Encoder {
         // Begin query.
         unsafe {
             self.context.device().cmd_begin_query(
-                self.encode_command_buffer,
-                self.query_pool,
+                command_buffer,
+                query_pool,
                 0,
                 vk::QueryControlFlags::empty(),
             );
@@ -578,55 +575,36 @@ impl H264Encoder {
 
         // Encode
         unsafe {
-            (self.video_encode_fn.fp().cmd_encode_video_khr)(
-                self.encode_command_buffer,
-                &encode_info,
-            );
+            (self.video_encode_fn.fp().cmd_encode_video_khr)(command_buffer, &encode_info);
         }
 
         // End query.
         unsafe {
             self.context
                 .device()
-                .cmd_end_query(self.encode_command_buffer, self.query_pool, 0);
+                .cmd_end_query(command_buffer, query_pool, 0);
         }
 
         // End video coding.
         let end_info = vk::VideoEndCodingInfoKHR::default();
         unsafe {
-            (self.video_queue_fn.fp().cmd_end_video_coding_khr)(
-                self.encode_command_buffer,
-                &end_info,
-            );
+            (self.video_queue_fn.fp().cmd_end_video_coding_khr)(command_buffer, &end_info);
         }
 
         // End command buffer.
-        unsafe {
-            self.context
-                .device()
-                .end_command_buffer(self.encode_command_buffer)
-        }
-        .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
+        unsafe { self.context.device().end_command_buffer(command_buffer) }
+            .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
-        // Submit, wait, and read bitstream.
+        // Submit without waiting; the slot is drained on a later encode call.
         let encode_queue = self.context.video_encode_queue().ok_or_else(|| {
             PixelForgeError::NoSuitableDevice("No video encode queue available".to_string())
         })?;
-
-        let encoded_data = unsafe {
-            submit_encode_and_read_bitstream(
-                self.context.device(),
-                self.encode_command_buffer,
-                self.encode_fence,
-                encode_queue,
-                self.query_pool,
-                self.bitstream_buffer_ptr,
-            )?
-        };
+        self.pipeline
+            .submit_current(self.context.device(), encode_queue)?;
 
         // Mark DPB slot as active.
         self.dpb_slot_active[self.current_dpb_slot as usize] = true;
 
-        Ok(encoded_data)
+        Ok(())
     }
 }

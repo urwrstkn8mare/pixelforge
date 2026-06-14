@@ -2,10 +2,10 @@ use super::H265Encoder;
 
 use crate::encoder::dpb::{DecodedPictureBuffer, DecodedPictureBufferTrait, DpbConfig};
 use crate::encoder::gop::GopStructure;
+use crate::encoder::pipeline::{EncodePipeline, PipelineConfig};
 use crate::encoder::resources::{
-    align_up, allocate_session_memory, clear_input_image, create_bitstream_buffer,
-    create_command_resources, create_dpb_images, create_image, get_video_format, lcm,
-    make_codec_name, map_bitstream_buffer, query_supported_video_formats, ClearImageParams,
+    align_up, allocate_session_memory, create_command_resources, create_dpb_images,
+    get_video_format, lcm, make_codec_name, query_supported_video_formats,
     MIN_BITSTREAM_BUFFER_SIZE,
 };
 use crate::encoder::{BitDepth, ColorDescription, PixelFormat};
@@ -308,16 +308,6 @@ impl H265Encoder {
             .chroma_bit_depth(bit_depth_flags)
             .push(&mut h265_profile_for_resources);
 
-        // Create input image
-        let (input_image, input_image_memory, input_image_view) = create_image(
-            &context,
-            aligned_width,
-            aligned_height,
-            picture_format,
-            false,
-            &profile_for_resources,
-        )?;
-
         // Determine DPB mode: use layered DPB when the driver does not advertise
         // support for separate reference images (required for AMD RADV).
         let supports_separate_dpb = capabilities
@@ -339,14 +329,6 @@ impl H265Encoder {
             use_layered_dpb,
         )?;
 
-        // Create bitstream buffer.
-        let (bitstream_buffer, bitstream_buffer_memory) =
-            create_bitstream_buffer(&context, MIN_BITSTREAM_BUFFER_SIZE, &profile_for_resources)?;
-
-        // Persistently map the bitstream buffer to avoid per-frame map/unmap overhead.
-        let bitstream_buffer_ptr =
-            map_bitstream_buffer(&context, bitstream_buffer_memory, MIN_BITSTREAM_BUFFER_SIZE)?;
-
         // Create command pool, buffers, and fences.
         // Use the transfer queue family for upload commands when the encode queue
         // doesn't support transfer operations (AMD RADV).
@@ -356,57 +338,23 @@ impl H265Encoder {
         let command_pool = cmd_resources.command_pool;
         let upload_command_pool = cmd_resources.upload_command_pool;
         let upload_command_buffer = cmd_resources.upload_command_buffer;
-        let encode_command_buffer = cmd_resources.encode_command_buffer;
         let upload_fence = cmd_resources.upload_fence;
-        let encode_fence = cmd_resources.encode_fence;
 
-        // Clear the input image so padding between user dimensions and the
-        // aligned coded extent is zero-initialized.
-        clear_input_image(
-            &context,
-            &ClearImageParams {
-                command_buffer: upload_command_buffer,
-                fence: upload_fence,
-                queue: context.transfer_queue(),
-                image: input_image,
-                width: aligned_width,
-                height: aligned_height,
-                pixel_format: config.pixel_format,
-                bit_depth: config.bit_depth,
-            },
-        )?;
-
-        // Create query pool
-        let mut h265_profile_info_query =
-            vk::VideoEncodeH265ProfileInfoKHR::default().std_profile_idc(profile_idc);
-
-        let mut profile_info_query = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
-            .chroma_subsampling(chroma_subsampling)
-            .luma_bit_depth(bit_depth_flags)
-            .chroma_bit_depth(bit_depth_flags)
-            .push(&mut h265_profile_info_query);
-
-        let mut encode_feedback_create = vk::QueryPoolVideoEncodeFeedbackCreateInfoKHR::default()
-            .encode_feedback_flags(
-                vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BUFFER_OFFSET
-                    | vk::VideoEncodeFeedbackFlagsKHR::BITSTREAM_BYTES_WRITTEN,
-            );
-
-        let query_pool_create_info = unsafe {
-            vk::QueryPoolCreateInfo::default()
-                .query_type(vk::QueryType::VIDEO_ENCODE_FEEDBACK_KHR)
-                .query_count(1)
-                .extend(&mut profile_info_query)
-                .push(&mut encode_feedback_create)
-        };
-
-        let query_pool = unsafe {
-            context
-                .device()
-                .create_query_pool(&query_pool_create_info, None)
-        }
-        .map_err(|e| PixelForgeError::QueryPool(e.to_string()))?;
+        // Create the depth-N encode pipeline (per-frame input images, bitstream
+        // buffers, encode command buffers, fences and query pools).
+        let pipeline = EncodePipeline::new(&PipelineConfig {
+            context: &context,
+            aligned_width,
+            aligned_height,
+            picture_format,
+            pixel_format: config.pixel_format,
+            bit_depth: config.bit_depth,
+            bitstream_buffer_size: MIN_BITSTREAM_BUFFER_SIZE,
+            profile_info: &profile_for_resources,
+            command_pool,
+            upload_command_buffer,
+            upload_fence,
+        })?;
 
         // Create DPB and GOP structure
         let mut dpb = DecodedPictureBuffer::new();
@@ -451,25 +399,16 @@ impl H265Encoder {
             session_memory,
             input_frame_num: 0,
             encode_frame_num: 0,
-            input_image,
-            input_image_memory,
-            input_image_view,
-            input_image_layout: vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
+            pipeline,
             dpb_images,
             dpb_image_memories,
             dpb_image_views,
             dpb_slot_count,
             use_layered_dpb,
-            bitstream_buffer,
-            bitstream_buffer_memory,
-            bitstream_buffer_ptr,
             command_pool,
             upload_command_pool,
             upload_command_buffer,
             upload_fence,
-            encode_command_buffer,
-            encode_fence,
-            query_pool,
             header_data: None,
             has_backward_reference: false,
             backward_reference_poc: 0,

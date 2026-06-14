@@ -175,6 +175,10 @@ fn run_test(
                 output_file.write_all(&packet.data)?;
             }
         }
+
+        for packet in encoder.flush()? {
+            output_file.write_all(&packet.data)?;
+        }
     }
 
     // 2. Decode to raw YUV

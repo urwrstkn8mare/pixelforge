@@ -11,6 +11,7 @@ pub mod dpb;
 pub mod gop;
 pub mod h264;
 pub mod h265;
+pub(crate) mod pipeline;
 pub mod reorder;
 pub mod resources;
 
@@ -445,6 +446,9 @@ impl Encoder {
     ///
     /// This accepts a source NV12 (YUV420) or planar YUV444 image on the GPU and encodes it directly.
     /// The source image must match the format and dimensions in the encoder configuration.
+    /// Encoders may return packets from earlier submitted frames because encode
+    /// readback is pipelined. Call [`Encoder::flush`] at end-of-stream to drain
+    /// any remaining packets.
     ///
     /// Use `InputImage` to create an image from YUV data:
     /// ```no_run

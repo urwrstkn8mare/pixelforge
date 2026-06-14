@@ -10,9 +10,8 @@ mod session_params;
 use ash::vk;
 use tracing::debug;
 
-use crate::encoder::resources::{
-    destroy_encoder_resources, upload_image_to_input, EncoderResources, UploadParams,
-};
+use crate::encoder::pipeline::EncodePipeline;
+use crate::encoder::resources::{upload_image_to_input, UploadParams};
 use crate::error::Result;
 
 use crate::encoder::dpb::DecodedPictureBuffer;
@@ -55,12 +54,8 @@ pub struct H264Encoder {
     frame_num_syntax: u32,
     idr_pic_id: u32,
 
-    // Resources
-    input_image: vk::Image,
-    input_image_memory: vk::DeviceMemory,
-    input_image_view: vk::ImageView,
-    /// Current Vulkan image layout of `input_image` (tracked to avoid UB when transitioning).
-    input_image_layout: vk::ImageLayout,
+    /// Depth-N encode pipeline (per-frame slots + submission ordering).
+    pipeline: EncodePipeline,
     /// DPB images (up to MAX_DPB_SLOTS for B-frame and long-term reference support).
     dpb_images: Vec<vk::Image>,
     dpb_image_memories: Vec<vk::DeviceMemory>,
@@ -71,19 +66,11 @@ pub struct H264Encoder {
     use_layered_dpb: bool,
     /// Tracks which DPB slots have been activated (used at least once).
     dpb_slot_active: Vec<bool>,
-    bitstream_buffer: vk::Buffer,
-    bitstream_buffer_memory: vk::DeviceMemory,
-    /// Persistently mapped pointer to the bitstream buffer (avoids per-frame map/unmap).
-    bitstream_buffer_ptr: *mut u8,
-
     // Command resources.
     command_pool: vk::CommandPool,
     upload_command_pool: vk::CommandPool,
     upload_command_buffer: vk::CommandBuffer,
     upload_fence: vk::Fence,
-    encode_command_buffer: vk::CommandBuffer,
-    encode_fence: vk::Fence,
-    query_pool: vk::QueryPool,
 
     // SPS/PPS written flag.
     sps_written: bool,
@@ -117,7 +104,8 @@ impl H264Encoder {
     /// with the same dimensions as the encoder configuration. The source image
     /// should be in GENERAL layout.
     fn upload_from_image(&mut self, src_image: vk::Image) -> Result<()> {
-        if src_image == self.input_image {
+        let slot = self.pipeline.current();
+        if src_image == slot.input_image {
             debug!("Source image is the encoder's input image, skipping upload copy");
             return Ok(());
         }
@@ -126,18 +114,18 @@ impl H264Encoder {
             upload_command_buffer: self.upload_command_buffer,
             upload_fence: self.upload_fence,
             src_image,
-            dst_image: self.input_image,
+            dst_image: slot.input_image,
             width: self.config.dimensions.width,
             height: self.config.dimensions.height,
             pixel_format: self.config.pixel_format,
-            input_image_layout: self.input_image_layout,
+            input_image_layout: slot.input_image_layout,
             upload_queue: self.context.transfer_queue(),
         };
 
         upload_image_to_input(&self.context, &params)?;
 
         // Update tracked layout.
-        self.input_image_layout = vk::ImageLayout::VIDEO_ENCODE_SRC_KHR;
+        self.pipeline.current_mut().input_image_layout = vk::ImageLayout::VIDEO_ENCODE_SRC_KHR;
 
         Ok(())
     }
@@ -150,37 +138,50 @@ unsafe impl Send for H264Encoder {}
 impl Drop for H264Encoder {
     fn drop(&mut self) {
         unsafe {
+            let device = self.context.device();
             // Wait on the queues used by the encoder rather than stalling
             // the entire device.
-            let _ = self
-                .context
-                .device()
-                .queue_wait_idle(self.context.transfer_queue());
+            let _ = device.queue_wait_idle(self.context.transfer_queue());
             if let Some(q) = self.context.video_encode_queue() {
-                let _ = self.context.device().queue_wait_idle(q);
+                let _ = device.queue_wait_idle(q);
             }
-            destroy_encoder_resources(
-                self.context.device(),
-                &self.video_queue_fn,
-                &EncoderResources {
-                    query_pool: self.query_pool,
-                    upload_fence: self.upload_fence,
-                    encode_fence: self.encode_fence,
-                    command_pool: self.command_pool,
-                    upload_command_pool: self.upload_command_pool,
-                    bitstream_buffer: self.bitstream_buffer,
-                    bitstream_buffer_memory: self.bitstream_buffer_memory,
-                    input_image: self.input_image,
-                    input_image_memory: self.input_image_memory,
-                    input_image_view: self.input_image_view,
-                    dpb_images: &self.dpb_images,
-                    dpb_image_memories: &self.dpb_image_memories,
-                    dpb_image_views: &self.dpb_image_views,
-                    session: self.session,
-                    session_params: self.session_params,
-                    session_memory: &self.session_memory,
-                },
+
+            self.pipeline.destroy(device);
+
+            device.destroy_fence(self.upload_fence, None);
+            device.destroy_command_pool(self.command_pool, None);
+            if self.upload_command_pool != self.command_pool {
+                device.destroy_command_pool(self.upload_command_pool, None);
+            }
+
+            for view in &self.dpb_image_views {
+                device.destroy_image_view(*view, None);
+            }
+            for image in &self.dpb_images {
+                device.destroy_image(*image, None);
+            }
+            for memory in &self.dpb_image_memories {
+                device.free_memory(*memory, None);
+            }
+
+            if self.session_params != vk::VideoSessionParametersKHR::null() {
+                (self
+                    .video_queue_fn
+                    .fp()
+                    .destroy_video_session_parameters_khr)(
+                    device.handle(),
+                    self.session_params,
+                    std::ptr::null(),
+                );
+            }
+            (self.video_queue_fn.fp().destroy_video_session_khr)(
+                device.handle(),
+                self.session,
+                std::ptr::null(),
             );
+            for memory in &self.session_memory {
+                device.free_memory(*memory, None);
+            }
         }
     }
 }

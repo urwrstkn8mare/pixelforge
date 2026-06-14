@@ -2,6 +2,7 @@ use super::H264Encoder;
 
 use crate::encoder::dpb::{DecodedPictureBufferTrait, DpbConfig, PictureStartInfo, PictureType};
 use crate::encoder::gop::{GopFrameType, GopPosition};
+use crate::encoder::pipeline::SlotPacketMetadata;
 use crate::encoder::{ColorDescription, EncodedPacket};
 use crate::error::Result;
 use crate::PixelForgeError;
@@ -15,7 +16,7 @@ impl H264Encoder {
     /// This image can be used as a target for `ColorConverter::convert` to avoid
     /// an intermediate copy.
     pub fn input_image(&self) -> vk::Image {
-        self.input_image
+        self.pipeline.input_image(self.context.device())
     }
 
     /// Encode a frame from a GPU image.
@@ -29,6 +30,7 @@ impl H264Encoder {
     /// The encoder will panic at creation time if B-frames are enabled (b_frame_count > 0),
     /// as B-frame encoding is not yet supported.
     pub fn encode(&mut self, src_image: vk::Image) -> Result<Vec<EncodedPacket>> {
+        let drained_packet = self.pipeline.drain_current(self.context.device())?;
         let gop_position = self.gop.get_next_frame();
         let display_order = self.input_frame_num;
         self.input_frame_num += 1;
@@ -41,10 +43,11 @@ impl H264Encoder {
         // Upload from GPU image.
         self.upload_from_image(src_image)?;
 
-        // Encode immediately.
-        let packet = self.encode_current_frame(&gop_position, display_order)?;
+        self.encode_current_frame(&gop_position, display_order)?;
 
-        Ok(vec![packet])
+        self.pipeline.advance();
+
+        Ok(drained_packet.into_iter().collect())
     }
 
     /// Internal method to encode the current frame already uploaded to input_image.
@@ -52,7 +55,7 @@ impl H264Encoder {
         &mut self,
         gop_position: &GopPosition,
         display_order: u64,
-    ) -> Result<EncodedPacket> {
+    ) -> Result<()> {
         let is_idr = gop_position.frame_type.is_idr();
         let is_reference = gop_position.is_reference;
         let is_b_frame = gop_position.frame_type == GopFrameType::B;
@@ -87,23 +90,28 @@ impl H264Encoder {
         let pic_order_cnt = gop_position.pic_order_cnt;
         let frame_num = self.frame_num_syntax;
 
-        let mut encoded_data = Vec::new();
-        if is_idr {
-            encoded_data.extend_from_slice(&self.get_h264_header()?);
+        let header = if is_idr {
             self.sps_written = true;
-        }
+            Some(self.get_h264_header()?)
+        } else {
+            None
+        };
 
-        encoded_data.extend_from_slice(&self.encode_frame_internal(
-            gop_position,
-            frame_num,
-            pic_order_cnt,
-            is_idr,
-        )?);
+        self.encode_frame_internal(gop_position, frame_num, pic_order_cnt, is_idr)?;
 
+        let dts = self.encode_frame_num;
         self.encode_frame_num += 1;
         if is_reference && !is_b_frame {
             self.frame_num_syntax = (self.frame_num_syntax + 1) % 256;
         }
+
+        self.pipeline.set_pending_metadata(SlotPacketMetadata {
+            frame_type,
+            is_key_frame: is_idr,
+            pts: display_order,
+            dts,
+            header,
+        });
 
         if is_reference {
             let pic_type = if is_idr {
@@ -147,19 +155,12 @@ impl H264Encoder {
             }
         }
 
-        Ok(EncodedPacket {
-            data: encoded_data,
-            frame_type,
-            is_key_frame: is_idr,
-            pts: display_order,
-            dts: self.encode_frame_num - 1,
-        })
+        Ok(())
     }
 
     /// Flush the encoder and get any remaining packets.
     pub fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
-        // No buffered frames in the current implementation.
-        Ok(Vec::new())
+        self.pipeline.flush(self.context.device())
     }
 
     /// Request that the next frame be an IDR frame.
@@ -239,16 +240,15 @@ impl H264Encoder {
     /// The next encoded frame will be an IDR with the new SPS/PPS prepended.
     pub fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
         // Wait for any in-flight encode to complete before modifying session params.
-        // Do NOT reset the fence here — submit_encode_and_read_bitstream() resets it
-        // before queue_submit. Leaving the fence signaled allows consecutive
-        // set_color_description() calls without deadlock.
+        // Do not reset the fences here; submit resets each slot fence before reuse.
+        let fences = self.pipeline.encode_fences();
         unsafe {
             self.context
                 .device()
-                .wait_for_fences(&[self.encode_fence], true, u64::MAX)
+                .wait_for_fences(&fences, true, u64::MAX)
                 .map_err(|e| {
                     PixelForgeError::Synchronization(format!(
-                        "Failed to wait for encode fence: {:?}",
+                        "Failed to wait for encode fences: {:?}",
                         e
                     ))
                 })?;

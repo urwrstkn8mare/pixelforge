@@ -10,6 +10,7 @@ mod session_params;
 use ash::vk;
 use tracing::debug;
 
+use crate::encoder::pipeline::EncodePipeline;
 use crate::encoder::resources::{upload_image_to_input, UploadParams};
 use crate::error::Result;
 
@@ -49,12 +50,8 @@ pub struct AV1Encoder {
     frame_num: u32,
     order_hint: u32,
 
-    // Resources
-    input_image: vk::Image,
-    input_image_memory: vk::DeviceMemory,
-    input_image_view: vk::ImageView,
-    /// Current Vulkan image layout of `input_image` (tracked to avoid UB when transitioning).
-    input_image_layout: vk::ImageLayout,
+    /// Depth-N encode pipeline (per-frame slots + submission ordering).
+    pipeline: EncodePipeline,
     /// DPB images for reference frames.
     dpb_images: Vec<vk::Image>,
     dpb_image_memories: Vec<vk::DeviceMemory>,
@@ -63,21 +60,11 @@ pub struct AV1Encoder {
     dpb_slot_count: usize,
     /// Whether each DPB slot has been activated (written to at least once).
     dpb_slot_active: Vec<bool>,
-    bitstream_buffer: vk::Buffer,
-    bitstream_buffer_memory: vk::DeviceMemory,
-    /// Size of the allocated bitstream buffer in bytes.
-    bitstream_buffer_size: usize,
-    /// Persistently mapped pointer to the bitstream buffer (avoids per-frame map/unmap).
-    bitstream_buffer_ptr: *mut u8,
-
     // Command resources.
     command_pool: vk::CommandPool,
     upload_command_pool: vk::CommandPool,
     upload_command_buffer: vk::CommandBuffer,
     upload_fence: vk::Fence,
-    encode_command_buffer: vk::CommandBuffer,
-    encode_fence: vk::Fence,
-    query_pool: vk::QueryPool,
 
     // Cached AV1 sequence header OBU (retrieved from session parameters).
     header_data: Option<Vec<u8>>,
@@ -97,7 +84,8 @@ impl AV1Encoder {
     /// encoder's configured pixel format and dimensions, and should be in
     /// GENERAL layout.
     fn upload_from_image(&mut self, src_image: vk::Image) -> Result<()> {
-        if src_image == self.input_image {
+        let slot = self.pipeline.current();
+        if src_image == slot.input_image {
             debug!("Source image is the encoder's input image, skipping upload copy");
             return Ok(());
         }
@@ -106,18 +94,18 @@ impl AV1Encoder {
             upload_command_buffer: self.upload_command_buffer,
             upload_fence: self.upload_fence,
             src_image,
-            dst_image: self.input_image,
+            dst_image: slot.input_image,
             width: self.config.dimensions.width,
             height: self.config.dimensions.height,
             pixel_format: self.config.pixel_format,
-            input_image_layout: self.input_image_layout,
+            input_image_layout: slot.input_image_layout,
             upload_queue: self.context.transfer_queue(),
         };
 
         upload_image_to_input(&self.context, &params)?;
 
         // Update tracked layout.
-        self.input_image_layout = vk::ImageLayout::VIDEO_ENCODE_SRC_KHR;
+        self.pipeline.current_mut().input_image_layout = vk::ImageLayout::VIDEO_ENCODE_SRC_KHR;
 
         Ok(())
     }
@@ -130,48 +118,24 @@ unsafe impl Send for AV1Encoder {}
 impl Drop for AV1Encoder {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.context.device().device_wait_idle();
-            self.context
-                .device()
-                .destroy_query_pool(self.query_pool, None);
-            self.context.device().destroy_fence(self.upload_fence, None);
-            self.context.device().destroy_fence(self.encode_fence, None);
-            self.context
-                .device()
-                .destroy_command_pool(self.command_pool, None);
-            if self.upload_command_pool != self.command_pool {
-                self.context
-                    .device()
-                    .destroy_command_pool(self.upload_command_pool, None);
+            let device = self.context.device();
+            let _ = device.queue_wait_idle(self.context.transfer_queue());
+            if let Some(q) = self.context.video_encode_queue() {
+                let _ = device.queue_wait_idle(q);
             }
-            self.context
-                .device()
-                .destroy_buffer(self.bitstream_buffer, None);
-            // Unmap the persistently mapped bitstream buffer before freeing memory.
-            self.context
-                .device()
-                .unmap_memory(self.bitstream_buffer_memory);
-            self.context
-                .device()
-                .free_memory(self.bitstream_buffer_memory, None);
-            self.context
-                .device()
-                .destroy_image_view(self.input_image_view, None);
-            self.context.device().destroy_image(self.input_image, None);
-            self.context
-                .device()
-                .free_memory(self.input_image_memory, None);
+
+            self.pipeline.destroy(device);
+
+            device.destroy_fence(self.upload_fence, None);
+            device.destroy_command_pool(self.command_pool, None);
+            if self.upload_command_pool != self.command_pool {
+                device.destroy_command_pool(self.upload_command_pool, None);
+            }
 
             for i in 0..self.dpb_images.len() {
-                self.context
-                    .device()
-                    .destroy_image_view(self.dpb_image_views[i], None);
-                self.context
-                    .device()
-                    .destroy_image(self.dpb_images[i], None);
-                self.context
-                    .device()
-                    .free_memory(self.dpb_image_memories[i], None);
+                device.destroy_image_view(self.dpb_image_views[i], None);
+                device.destroy_image(self.dpb_images[i], None);
+                device.free_memory(self.dpb_image_memories[i], None);
             }
 
             if self.session_params != vk::VideoSessionParametersKHR::null() {
@@ -181,7 +145,7 @@ impl Drop for AV1Encoder {
             self.video_queue_fn
                 .destroy_video_session(self.session, None);
             for mem in &self.session_memory {
-                self.context.device().free_memory(*mem, None);
+                device.free_memory(*mem, None);
             }
         }
     }

@@ -1,6 +1,7 @@
 use super::AV1Encoder;
 
 use crate::encoder::gop::{GopFrameType, GopPosition};
+use crate::encoder::pipeline::SlotPacketMetadata;
 use crate::encoder::{ColorDescription, EncodedPacket};
 use crate::error::{PixelForgeError, Result};
 use ash::vk;
@@ -12,7 +13,7 @@ impl AV1Encoder {
     /// This image can be used as a target for `ColorConverter::convert` to avoid
     /// an intermediate copy.
     pub fn input_image(&self) -> vk::Image {
-        self.input_image
+        self.pipeline.input_image(self.context.device())
     }
 
     /// Encode a frame from a GPU image.
@@ -26,6 +27,7 @@ impl AV1Encoder {
     /// The encoder will panic at creation time if B-frames are enabled (b_frame_count > 0),
     /// as B-frame encoding is not yet supported.
     pub fn encode(&mut self, src_image: vk::Image) -> Result<Vec<EncodedPacket>> {
+        let drained_packet = self.pipeline.drain_current(self.context.device())?;
         let gop_position = self.gop.get_next_frame();
         let display_order = self.input_frame_num;
         self.input_frame_num += 1;
@@ -38,10 +40,11 @@ impl AV1Encoder {
         // Upload from GPU image.
         self.upload_from_image(src_image)?;
 
-        // Encode immediately.
-        let packet = self.encode_current_frame(&gop_position, display_order)?;
+        self.encode_current_frame(&gop_position, display_order)?;
 
-        Ok(vec![packet])
+        self.pipeline.advance();
+
+        Ok(drained_packet.into_iter().collect())
     }
 
     /// Internal method to encode the current frame already uploaded to input_image.
@@ -49,7 +52,7 @@ impl AV1Encoder {
         &mut self,
         gop_position: &GopPosition,
         display_order: u64,
-    ) -> Result<EncodedPacket> {
+    ) -> Result<()> {
         let is_key_frame =
             gop_position.frame_type.is_idr() || gop_position.frame_type == GopFrameType::I;
         let is_reference = gop_position.is_reference;
@@ -71,12 +74,12 @@ impl AV1Encoder {
             self.references.clear();
         }
 
-        let mut encoded_data = Vec::new();
+        let mut header = Vec::new();
 
         // AV1 Temporal Delimiter OBU: type=2, has_size=1, size=0.
         // Required as the first OBU in each temporal unit for conformant bitstreams.
         // This enables ffmpeg's AV1 demuxer to detect frame boundaries in raw OBU streams.
-        encoded_data.extend_from_slice(&[0x12, 0x00]);
+        header.extend_from_slice(&[0x12, 0x00]);
 
         // For key frames, prepend the AV1 Sequence Header OBU.
         // This is required for AV1 decoders to initialize (equivalent to H.265 VPS/SPS/PPS).
@@ -90,18 +93,27 @@ impl AV1Encoder {
                 );
                 self.header_data = Some(header);
             }
-            if let Some(ref header) = self.header_data {
-                encoded_data.extend_from_slice(header);
+            if let Some(ref sequence_header) = self.header_data {
+                header.extend_from_slice(sequence_header);
             }
         }
 
-        encoded_data.extend_from_slice(&self.encode_frame_internal(gop_position, is_key_frame)?);
+        self.encode_frame_internal(gop_position, is_key_frame)?;
 
         // Save the order_hint used during encoding BEFORE incrementing.
         let encoded_order_hint = self.order_hint;
+        let dts = self.encode_frame_num;
         self.encode_frame_num += 1;
         self.frame_num += 1;
         self.order_hint = (self.order_hint + 1) & 0xFF; // 8-bit order hint
+
+        self.pipeline.set_pending_metadata(SlotPacketMetadata {
+            frame_type,
+            is_key_frame,
+            pts: display_order,
+            dts,
+            header: Some(header),
+        });
 
         // Update reference frames and DPB slot management
         // Key frames refresh all reference slots. Inter frames refresh only their own slot,
@@ -140,19 +152,12 @@ impl AV1Encoder {
 
         self.current_dpb_slot = next_slot;
 
-        Ok(EncodedPacket {
-            data: encoded_data,
-            frame_type,
-            is_key_frame,
-            pts: display_order,
-            dts: self.encode_frame_num - 1,
-        })
+        Ok(())
     }
 
     /// Flush the encoder and get any remaining packets.
     pub fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
-        // No buffered frames in the current implementation.
-        Ok(Vec::new())
+        self.pipeline.flush(self.context.device())
     }
 
     /// Request that the next frame be an IDR/key frame.
@@ -224,16 +229,15 @@ impl AV1Encoder {
     /// be a key frame with the new sequence header prepended.
     pub fn set_color_description(&mut self, desc: ColorDescription) -> Result<()> {
         // Wait for any in-flight encode to complete before modifying session params.
-        // Do NOT reset the fence here — submit_encode_and_read_bitstream() resets it
-        // before queue_submit. Leaving the fence signaled allows consecutive
-        // set_color_description() calls without deadlock.
+        // Do not reset the fences here; submit resets each slot fence before reuse.
+        let fences = self.pipeline.encode_fences();
         unsafe {
             self.context
                 .device()
-                .wait_for_fences(&[self.encode_fence], true, u64::MAX)
+                .wait_for_fences(&fences, true, u64::MAX)
                 .map_err(|e| {
                     PixelForgeError::Synchronization(format!(
-                        "Failed to wait for encode fence: {:?}",
+                        "Failed to wait for encode fences: {:?}",
                         e
                     ))
                 })?;
