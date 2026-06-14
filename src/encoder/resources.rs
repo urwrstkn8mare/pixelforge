@@ -1349,7 +1349,10 @@ pub(crate) unsafe fn record_post_encode_dpb_barrier(
 /// Submit an encode command buffer without waiting for completion.
 ///
 /// Timeline semaphore waits/signals are used to keep shared DPB access ordered
-/// across pipelined slots while leaving bitstream readback delayed.
+/// across pipelined slots while leaving bitstream readback delayed. Uses
+/// Synchronization2 (`queue_submit2`) so the timeline wait/signal are scoped to
+/// the `VIDEO_ENCODE` stage rather than `ALL_COMMANDS`, avoiding unnecessary
+/// over-synchronization.
 ///
 /// # Safety
 ///
@@ -1362,44 +1365,39 @@ pub(crate) unsafe fn submit_encode_only(
     wait_timeline: Option<(vk::Semaphore, u64)>,
     signal_timeline: Option<(vk::Semaphore, u64)>,
 ) -> Result<()> {
-    let mut wait_semaphores = Vec::new();
-    let mut wait_dst_stage_mask = Vec::new();
-    let mut wait_values = Vec::new();
-    let mut signal_semaphores = Vec::new();
-    let mut signal_values = Vec::new();
+    let command_buffer_info = vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer);
+    let command_buffer_infos = [command_buffer_info];
 
-    let mut submit_info =
-        vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
+    let wait_infos: Vec<vk::SemaphoreSubmitInfo> = wait_timeline
+        .into_iter()
+        .map(|(semaphore, value)| {
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(semaphore)
+                .value(value)
+                .stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+        })
+        .collect();
+    let signal_infos: Vec<vk::SemaphoreSubmitInfo> = signal_timeline
+        .into_iter()
+        .map(|(semaphore, value)| {
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(semaphore)
+                .value(value)
+                .stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+        })
+        .collect();
 
-    if let Some((semaphore, value)) = wait_timeline {
-        wait_semaphores.push(semaphore);
-        wait_dst_stage_mask.push(vk::PipelineStageFlags::ALL_COMMANDS);
-        wait_values.push(value);
-        submit_info = submit_info
-            .wait_semaphores(&wait_semaphores)
-            .wait_dst_stage_mask(&wait_dst_stage_mask);
-    }
-
-    if let Some((semaphore, value)) = signal_timeline {
-        signal_semaphores.push(semaphore);
-        signal_values.push(value);
-        submit_info = submit_info.signal_semaphores(&signal_semaphores);
-    }
-
-    let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
-        .wait_semaphore_values(&wait_values)
-        .signal_semaphore_values(&signal_values);
-
-    if !wait_values.is_empty() || !signal_values.is_empty() {
-        submit_info = submit_info.push(&mut timeline_info);
-    }
+    let submit_info = vk::SubmitInfo2::default()
+        .wait_semaphore_infos(&wait_infos)
+        .command_buffer_infos(&command_buffer_infos)
+        .signal_semaphore_infos(&signal_infos);
 
     device
         .reset_fences(&[fence])
         .map_err(|e| PixelForgeError::Synchronization(e.to_string()))?;
 
     device
-        .queue_submit(encode_queue, &[submit_info], fence)
+        .queue_submit2(encode_queue, &[submit_info], fence)
         .map_err(|e| PixelForgeError::CommandBuffer(e.to_string()))?;
 
     Ok(())

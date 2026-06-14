@@ -25,6 +25,12 @@ impl H264Encoder {
     /// any CPU-side data copies. The source image must be in NV12 format with the
     /// same dimensions as the encoder configuration, and should be in GENERAL layout.
     ///
+    /// Encoding is pipelined (depth 2): this submits the given frame to the encode
+    /// queue without blocking, then returns the packet for a *previously* submitted
+    /// frame. The first call returns an empty `Vec` while the pipeline fills, and
+    /// thereafter one packet per call. Call [`Self::flush`] at end-of-stream to drain
+    /// the remaining in-flight frames.
+    ///
     /// # Panics
     ///
     /// The encoder will panic at creation time if B-frames are enabled (b_frame_count > 0),
